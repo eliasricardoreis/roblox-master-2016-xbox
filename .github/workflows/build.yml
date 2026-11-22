@@ -1,4 +1,4 @@
-name: Build Android APK (2016 Source)
+name: Build Windows EXE (2016 Source)
 
 on:
   push:
@@ -8,154 +8,79 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-apk:
-    runs-on: ubuntu-latest
+  build-windows:
+    runs-on: windows-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 8 & JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '8'
-          distribution: 'temurin'
-
-      - name: Setup JDK 17 for SDK Manager
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Cache Android SDK, Gradle & Boost
+      - name: Cache Boost Headers
         uses: actions/cache@v4
         with:
-          path: |
-            /usr/local/lib/android/sdk
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            third_party/boost
-          key: sdk-jdk8-17-gradle-boost-v4-${{ hashFiles('**/gradle-wrapper.properties', '**/build.gradle*') }}
-          restore-keys: |
-            sdk-jdk8-17-gradle-boost-v4-
-            sdk-jdk8-17-
-
-      - name: Setup Android SDK & NDK (Fast)
-        uses: android-actions/setup-android@v3
-        with:
-          packages: 'platforms;android-28 build-tools;28.0.3 ndk;26.1.10909125 cmake;3.22.1'
+          path: third_party/boost
+          key: win-boost-1.58.0-v1
 
       - name: Download & Extract Boost Headers (1.58.0)
+        shell: pwsh
         run: |
-          if [ ! -d "third_party/boost/boost" ]; then
-            mkdir -p third_party/boost
-            curl -sL https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2 -o boost.tar.bz2
-            tar -xjf boost.tar.bz2 -C third_party/boost --strip-components=1 boost_1_58_0/boost
-            rm -f boost.tar.bz2
-          fi
+          if (-not (Test-Path "third_party/boost/boost")) {
+            New-Item -ItemType Directory -Force -Path "third_party/boost" | Out-Null
+            curl.exe -sL "https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2" -o "boost.tar.bz2"
+            tar.exe -xjf "boost.tar.bz2" -C "third_party/boost" --strip-components=1 "boost_1_58_0/boost"
+            Remove-Item -Force "boost.tar.bz2"
+          }
 
-      - name: Fix Linux Case-Sensitivity & Create Shims
+      - name: Setup Visual Studio Developer Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build Windows Project
+        shell: pwsh
         run: |
-          for pair in \
-            "App/include/v8tree:App/include/V8Tree" \
-            "App/include/util:App/include/Util" \
-            "App/include/reflection:App/include/Reflection" \
-            "App/include/rbx:App/include/Rbx" \
-            "App/include/v8datamodel:App/include/V8DataModel" \
-            "App/include/v8world:App/include/V8World" \
-            "App/include/v8xml:App/include/V8Xml" \
-            "App/include/security:App/include/Security" \
-            "App/include/script:App/include/Script" \
-            "App/include/humanoid:App/include/Humanoid" \
-            "App/include/network:App/include/Network" \
-            "Rendering/g3d:Rendering/G3D" \
-            "Rendering/G3D/include/g3d:Rendering/G3D/include/G3D"
-          do
-            SRC="${pair%%:*}"
-            DST="${pair##*:}"
-            [ -d "$SRC" ] && [ ! -e "$DST" ] && ln -s "$(basename "$SRC")" "$DST" || true
-          done
+          $root = (Get-Location).Path
+          $boostInc = "$root\third_party\boost"
+          $extraInc = "$boostInc;$root;$root\App\include;$root\ClientShared;$root\Log\include;$root\Rendering\G3D\include;$root\Network\include"
 
-          mkdir -p android_port/shims/sys
-          printf '%s\n' \
-            '#pragma once' \
-            '#ifdef __cplusplus' \
-            'extern "C" {' \
-            '#endif' \
-            'static inline int __atomic_cmpxchg(int o, int n, volatile int* p) { return __sync_val_compare_and_swap(p, o, n); }' \
-            'static inline int __atomic_inc(volatile int* p) { return __sync_fetch_and_add(p, 1); }' \
-            'static inline int __atomic_dec(volatile int* p) { return __sync_fetch_and_sub(p, 1); }' \
-            'static inline int __atomic_swap(int n, volatile int* p) { return __sync_lock_test_and_set(p, n); }' \
-            '#ifdef __cplusplus' \
-            '}' \
-            '#endif' > android_port/shims/sys/atomics.h
+          # Garante INCLUDE com Boost e pastas principais do projeto
+          $env:INCLUDE = "$extraInc;$env:INCLUDE"
 
-          if [ -f "ClientShared/StringConv.cpp" ]; then
-            printf '%s\n' \
-              '#include "StringConv.h"' \
-              '#include <codecvt>' \
-              '#include <locale>' \
-              '#include <string>' \
-              'namespace RBX {' \
-              '    std::string utf8_encode(const std::wstring& wstr) {' \
-              '        if (wstr.empty()) return std::string();' \
-              '        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;' \
-              '        return conv.to_bytes(wstr);' \
-              '    }' \
-              '    std::wstring utf8_decode(const std::string& str) {' \
-              '        if (str.empty()) return std::wstring();' \
-              '        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;' \
-              '        return conv.from_bytes(str);' \
-              '    }' \
-              '}' > ClientShared/StringConv.cpp
-          fi
+          $sln = Get-ChildItem -Path . -Filter "*.sln" -Recurse -Depth 4 | Select-Object -First 1
 
-      - name: Build Debug APK (Sequential)
-        env:
-          ROOT_DIR: ${{ github.workspace }}
-          ANDROID_HOME: /usr/local/lib/android/sdk
-          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-          NDK_PATH: /usr/local/lib/android/sdk/ndk/26.1.10909125
-        run: |
-          # Aponta o Gradle 4.x para o JDK 8 instalado no runner
-          JDK8_DIR=$(dirname "$(dirname "$(readlink -f /usr/lib/jvm/temurin-8-jdk-amd64/bin/java 2>/dev/null || ls -d /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/8.*/* 2>/dev/null | head -n 1)")")
-          if [ -n "$JDK8_DIR" ] && [ -x "$JDK8_DIR/bin/java" ]; then
-            export JAVA_HOME="$JDK8_DIR"
-            export PATH="$JAVA_HOME/bin:$PATH"
-            echo "Usando JAVA_HOME=$JAVA_HOME"
-          fi
+          if ($sln) {
+            Write-Host "Compilando Solution: $($sln.FullName)"
+            msbuild.exe "$($sln.FullName)" `
+              /p:Configuration=Release `
+              /p:Platform=x64 `
+              /maxCpuCount:1 `
+              /p:ForceImportBeforeCppTargets="" `
+              /p:WarningLevel=0 `
+              /p:TreatWarningsAsErrors=false
+          } else {
+            $cmake = Get-ChildItem -Path . -Filter "CMakeLists.txt" -Recurse -Depth 4 | Select-Object -First 1
+            if (-not $cmake) {
+              Write-Error "Nenhum arquivo .sln ou CMakeLists.txt encontrado no repositório."
+              exit 1
+            }
+            $srcDir = Split-Path $cmake.FullName
+            $buildDir = "$root\build_win"
+            New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
+            Write-Host "Compilando via CMake em: $srcDir"
+            cmake.exe -S "$srcDir" -B "$buildDir" -A x64 `
+              -DCMAKE_CXX_FLAGS="/I`"$boostInc`" /permissive /w" `
+              -DCMAKE_C_FLAGS="/I`"$boostInc`" /w"
+            cmake.exe --build "$buildDir" --config Release --parallel 1
+          }
 
-          EXTRA_INCLUDES="-I${ROOT_DIR} -I${ROOT_DIR}/android_port/shims -I${ROOT_DIR}/third_party/boost -I${ROOT_DIR}/App/include -I${ROOT_DIR}/ClientShared -I${ROOT_DIR}/Log/include -I${ROOT_DIR}/Rendering/G3D/include -I${ROOT_DIR}/Network/include"
-
-          if [ -f "Android/gradlew" ]; then
-            TARGET_DIR="Android"
-          elif [ -f "RobloxHybrid/platforms/android/Hybrid/gradlew" ]; then
-            TARGET_DIR="RobloxHybrid/platforms/android/Hybrid"
-          else
-            GRADLEW_FOUND=$(find . -maxdepth 5 -name "gradlew" | head -n 1)
-            [ -z "$GRADLEW_FOUND" ] && echo "gradlew não encontrado!" && exit 1
-            TARGET_DIR=$(dirname "$GRADLEW_FOUND")
-          fi
-
-          [ -d "$NDK_PATH" ] && [ ! -e "$NDK_PATH/platforms" ] && ln -s . "$NDK_PATH/platforms" || true
-
-          printf 'sdk.dir=%s\nndk.dir=%s\n' "$ANDROID_HOME" "$NDK_PATH" > "$TARGET_DIR/local.properties"
-          printf 'org.gradle.parallel=false\norg.gradle.caching=true\n' >> "$TARGET_DIR/gradle.properties"
-
-          cd "$TARGET_DIR"
-          chmod +x gradlew
-
-          ./gradlew assembleDebug \
-            --build-cache \
-            -Pandroid.ndkVersion=26.1.10909125 \
-            -DCMAKE_CXX_FLAGS="${EXTRA_INCLUDES} -std=c++14 -fpermissive -Wno-everything" \
-            -DCMAKE_C_FLAGS="${EXTRA_INCLUDES} -Wno-everything" \
-            --stacktrace
-
-      - name: Upload Generated APK
+      - name: Upload Built Windows Binaries
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
-          path: '**/build/outputs/apk/**/*.apk'
+          name: windows-build-release
+          path: |
+            **/*.exe
+            **/*.dll
+            !**/vcpkg/**
+            !**/third_party/**
           if-no-files-found: error
