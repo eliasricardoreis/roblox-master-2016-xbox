@@ -21,34 +21,33 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.5'
-
       - name: Setup Android SDK & NDK 26
         uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125 cmake;3.22.1'
 
-      - name: Cache Boost Headers
-        id: cache-boost
+      - name: Cache Gradle & Boost
         uses: actions/cache@v4
         with:
-          path: third_party/boost
-          key: boost-1.58.0-headers
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            third_party/boost
+          key: gradle-boost-cache-v1-${{ hashFiles('**/gradle-wrapper.properties', '**/build.gradle*') }}
+          restore-keys: |
+            gradle-boost-cache-v1-
 
       - name: Download & Extract Boost Headers (1.58.0)
-        if: steps.cache-boost.outputs.cache-hit != 'true'
         run: |
-          mkdir -p third_party/boost
-          curl -sL https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2 -o boost.tar.bz2
-          tar -xjf boost.tar.bz2 -C third_party/boost --strip-components=1 boost_1_58_0/boost
-          rm boost.tar.bz2
+          if [ ! -d "third_party/boost/boost" ]; then
+            mkdir -p third_party/boost
+            curl -sL https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2 -o boost.tar.bz2
+            tar -xjf boost.tar.bz2 -C third_party/boost --strip-components=1 boost_1_58_0/boost
+            rm -f boost.tar.bz2
+          fi
 
       - name: Fix Linux Case-Sensitivity & Create Shims
         run: |
-          # 1. Symlinks para pastas em minúsculo
           for pair in \
             "App/include/v8tree:App/include/V8Tree" \
             "App/include/util:App/include/Util" \
@@ -69,7 +68,6 @@ jobs:
             [ -d "$SRC" ] && [ ! -e "$DST" ] && ln -s "$(basename "$SRC")" "$DST" || true
           done
 
-          # 2. Shim sys/atomics.h para NDK 26
           mkdir -p android_port/shims/sys
           printf '%s\n' \
             '#pragma once' \
@@ -84,7 +82,6 @@ jobs:
             '}' \
             '#endif' > android_port/shims/sys/atomics.h
 
-          # 3. Patch StringConv.cpp para Android
           if [ -f "ClientShared/StringConv.cpp" ]; then
             printf '%s\n' \
               '#include "StringConv.h"' \
@@ -111,23 +108,21 @@ jobs:
         run: |
           EXTRA_INCLUDES="-I${ROOT_DIR} -I${ROOT_DIR}/android_port/shims -I${ROOT_DIR}/third_party/boost -I${ROOT_DIR}/App/include -I${ROOT_DIR}/ClientShared -I${ROOT_DIR}/Log/include -I${ROOT_DIR}/Rendering/G3D/include -I${ROOT_DIR}/Network/include"
 
-          GRADLEW_PATH=$(find . -maxdepth 3 -name "gradlew" | head -n 1)
-          if [ -n "$GRADLEW_PATH" ]; then
-            cd "$(dirname "$GRADLEW_PATH")"
-            chmod +x gradlew
-            GRADLE_BIN="./gradlew"
+          if [ -f "Android/gradlew" ]; then
+            TARGET_DIR="Android"
+          elif [ -f "RobloxHybrid/platforms/android/Hybrid/gradlew" ]; then
+            TARGET_DIR="RobloxHybrid/platforms/android/Hybrid"
           else
-            BUILD_GRADLE=$(find . -maxdepth 3 \( -name "settings.gradle*" -o -name "build.gradle*" \) | head -n 1)
-            if [ -z "$BUILD_GRADLE" ]; then
-              echo "ERRO: Nenhum projeto Gradle encontrado no repositório!"
-              ls -la
-              exit 1
-            fi
-            cd "$(dirname "$BUILD_GRADLE")"
-            GRADLE_BIN="gradle"
+            GRADLEW_FOUND=$(find . -maxdepth 5 -name "gradlew" | head -n 1)
+            [ -z "$GRADLEW_FOUND" ] && echo "gradlew não encontrado!" && exit 1
+            TARGET_DIR=$(dirname "$GRADLEW_FOUND")
           fi
 
-          $GRADLE_BIN assembleDebug \
+          echo "Compilando em: $TARGET_DIR"
+          cd "$TARGET_DIR"
+          chmod +x gradlew
+
+          ./gradlew assembleDebug \
             --parallel \
             --build-cache \
             -Pandroid.ndkVersion=26.1.10909125 \
