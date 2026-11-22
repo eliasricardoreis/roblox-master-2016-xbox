@@ -15,10 +15,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 8
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
+          java-version: '8'
           distribution: 'temurin'
 
       - name: Cache Android SDK, Gradle & Boost
@@ -29,12 +29,12 @@ jobs:
             ~/.gradle/caches
             ~/.gradle/wrapper
             third_party/boost
-          key: sdk-ndk26-gradle-boost-v2-${{ hashFiles('**/gradle-wrapper.properties', '**/build.gradle*') }}
+          key: sdk-jdk8-gradle-boost-v3-${{ hashFiles('**/gradle-wrapper.properties', '**/build.gradle*') }}
           restore-keys: |
-            sdk-ndk26-gradle-boost-v2-
-            sdk-ndk26-
+            sdk-jdk8-gradle-boost-v3-
+            sdk-jdk8-
 
-      - name: Setup Android SDK & NDK 26 (Fast)
+      - name: Setup Android SDK & NDK (Fast)
         uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-28 build-tools;28.0.3 ndk;26.1.10909125 cmake;3.22.1'
@@ -123,10 +123,8 @@ jobs:
             TARGET_DIR=$(dirname "$GRADLEW_FOUND")
           fi
 
-          # Garante pasta platforms dentro do NDK caso o Gradle 4.x exija na checagem inicial
           [ -d "$NDK_PATH" ] && [ ! -e "$NDK_PATH/platforms" ] && ln -s . "$NDK_PATH/platforms" || true
 
-          # Sobrescreve local.properties para remover H:\AndroidSDK e desativa paralelo
           printf 'sdk.dir=%s\nndk.dir=%s\n' "$ANDROID_HOME" "$NDK_PATH" > "$TARGET_DIR/local.properties"
           printf 'org.gradle.parallel=false\norg.gradle.caching=true\n' >> "$TARGET_DIR/gradle.properties"
 
