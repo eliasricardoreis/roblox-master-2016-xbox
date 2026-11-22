@@ -21,21 +21,23 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK & NDK 26
-        uses: android-actions/setup-android@v3
-        with:
-          packages: 'platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125 cmake;3.22.1'
-
-      - name: Cache Gradle & Boost
+      - name: Cache Android SDK, Gradle & Boost
         uses: actions/cache@v4
         with:
           path: |
+            /usr/local/lib/android/sdk
             ~/.gradle/caches
             ~/.gradle/wrapper
             third_party/boost
-          key: gradle-boost-cache-v1-${{ hashFiles('**/gradle-wrapper.properties', '**/build.gradle*') }}
+          key: sdk-ndk26-gradle-boost-v2-${{ hashFiles('**/gradle-wrapper.properties', '**/build.gradle*') }}
           restore-keys: |
-            gradle-boost-cache-v1-
+            sdk-ndk26-gradle-boost-v2-
+            sdk-ndk26-
+
+      - name: Setup Android SDK & NDK 26 (Fast)
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-28 build-tools;28.0.3 ndk;26.1.10909125 cmake;3.22.1'
 
       - name: Download & Extract Boost Headers (1.58.0)
         run: |
@@ -102,9 +104,12 @@ jobs:
               '}' > ClientShared/StringConv.cpp
           fi
 
-      - name: Build Debug APK
+      - name: Build Debug APK (Sequential)
         env:
           ROOT_DIR: ${{ github.workspace }}
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          NDK_PATH: /usr/local/lib/android/sdk/ndk/26.1.10909125
         run: |
           EXTRA_INCLUDES="-I${ROOT_DIR} -I${ROOT_DIR}/android_port/shims -I${ROOT_DIR}/third_party/boost -I${ROOT_DIR}/App/include -I${ROOT_DIR}/ClientShared -I${ROOT_DIR}/Log/include -I${ROOT_DIR}/Rendering/G3D/include -I${ROOT_DIR}/Network/include"
 
@@ -118,12 +123,17 @@ jobs:
             TARGET_DIR=$(dirname "$GRADLEW_FOUND")
           fi
 
-          echo "Compilando em: $TARGET_DIR"
+          # Garante pasta platforms dentro do NDK caso o Gradle 4.x exija na checagem inicial
+          [ -d "$NDK_PATH" ] && [ ! -e "$NDK_PATH/platforms" ] && ln -s . "$NDK_PATH/platforms" || true
+
+          # Sobrescreve local.properties para remover H:\AndroidSDK e desativa paralelo
+          printf 'sdk.dir=%s\nndk.dir=%s\n' "$ANDROID_HOME" "$NDK_PATH" > "$TARGET_DIR/local.properties"
+          printf 'org.gradle.parallel=false\norg.gradle.caching=true\n' >> "$TARGET_DIR/gradle.properties"
+
           cd "$TARGET_DIR"
           chmod +x gradlew
 
           ./gradlew assembleDebug \
-            --parallel \
             --build-cache \
             -Pandroid.ndkVersion=26.1.10909125 \
             -DCMAKE_CXX_FLAGS="${EXTRA_INCLUDES} -std=c++14 -fpermissive -Wno-everything" \
