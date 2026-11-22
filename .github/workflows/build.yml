@@ -1,9 +1,7 @@
-name: Build Android APK (2016 Source)
+name: Build Android APK
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
     branches: [ main, master ]
   workflow_dispatch:
 
@@ -26,16 +24,17 @@ jobs:
         with:
           packages: 'platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125 cmake;3.22.1'
 
-      - name: Download & Extract Boost Headers (1.58.0)
+      - name: Prepare Boost, Symlinks & NDK Shims
         run: |
-          mkdir -p third_party/boost
-          curl -L https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2 -o boost.tar.bz2
-          tar -xjf boost.tar.bz2 -C third_party/boost --strip-components=1 boost_1_58_0/boost
-          rm boost.tar.bz2
+          # 1. Boost Headers (se ainda não estiverem no repo)
+          if [ ! -d "third_party/boost/boost" ]; then
+            mkdir -p third_party/boost
+            curl -sL https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2 -o boost.tar.bz2
+            tar -xjf boost.tar.bz2 -C third_party/boost --strip-components=1 boost_1_58_0/boost
+            rm boost.tar.bz2
+          fi
 
-      - name: Fix Linux Case-Sensitivity Symlinks
-        run: |
-          # Cria links simbólicos para pastas em minúsculo que o código C++ inclui com maiúsculas
+          # 2. Symlinks para case-sensitivity do Linux
           [ -d "App/include/v8tree" ] && [ ! -e "App/include/V8Tree" ] && ln -s v8tree App/include/V8Tree || true
           [ -d "App/include/util" ] && [ ! -e "App/include/Util" ] && ln -s util App/include/Util || true
           [ -d "App/include/reflection" ] && [ ! -e "App/include/Reflection" ] && ln -s reflection App/include/Reflection || true
@@ -50,83 +49,22 @@ jobs:
           [ -d "Rendering/g3d" ] && [ ! -e "Rendering/G3D" ] && ln -s g3d Rendering/G3D || true
           [ -d "Rendering/G3D/include/g3d" ] && [ ! -e "Rendering/G3D/include/G3D" ] && ln -s g3d Rendering/G3D/include/G3D || true
 
-      - name: Create NDK 26 Compatibility Shims (sys/atomics.h)
-        run: |
+          # 3. Shim sys/atomics.h para NDK 26
           mkdir -p android_port/shims/sys
           cat << 'EOF' > android_port/shims/sys/atomics.h
           #pragma once
-          #include <stdint.h>
-
           #ifdef __cplusplus
           extern "C" {
           #endif
-
-          static inline int __atomic_cmpxchg(int old_val, int new_val, volatile int* ptr) {
-              return __sync_val_compare_and_swap(ptr, old_val, new_val);
-          }
-
-          static inline int __atomic_inc(volatile int* ptr) {
-              return __sync_fetch_and_add(ptr, 1);
-          }
-
-          static inline int __atomic_dec(volatile int* ptr) {
-              return __sync_fetch_and_sub(ptr, 1);
-          }
-
-          static inline int __atomic_swap(int new_val, volatile int* ptr) {
-              return __sync_lock_test_and_set(ptr, new_val);
-          }
-
+          static inline int __atomic_cmpxchg(int o, int n, volatile int* p) { return __sync_val_compare_and_swap(p, o, n); }
+          static inline int __atomic_inc(volatile int* p) { return __sync_fetch_and_add(p, 1); }
+          static inline int __atomic_dec(volatile int* p) { return __sync_fetch_and_sub(p, 1); }
+          static inline int __atomic_swap(int n, volatile int* p) { return __sync_lock_test_and_set(p, n); }
           #ifdef __cplusplus
           }
           #endif
           EOF
 
-      - name: Patch Win32 StringConv.cpp for Android
-        run: |
+          # 4. Patch StringConv.cpp para Android
           if [ -f "ClientShared/StringConv.cpp" ]; then
-            cat << 'EOF' > ClientShared/StringConv.cpp
-          #include "StringConv.h"
-          #include <codecvt>
-          #include <locale>
-          #include <string>
-
-          namespace RBX {
-              std::string utf8_encode(const std::wstring& wstr) {
-                  if (wstr.empty()) return std::string();
-                  std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
-                  return conv.to_bytes(wstr);
-              }
-
-              std::wstring utf8_decode(const std::string& str) {
-                  if (str.empty()) return std::wstring();
-                  std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
-                  return conv.from_bytes(str);
-              }
-          }
-          EOF
-          fi
-
-      - name: Grant Execute Permission to Gradlew
-        run: chmod +x gradlew || true
-
-      - name: Build Debug APK
-        env:
-          ROOT_DIR: ${{ github.workspace }}
-        run: |
-          # Passa os caminhos de include extra diretamente para o CMake via Gradle
-          EXTRA_INCLUDES="-I${ROOT_DIR} -I${ROOT_DIR}/android_port/shims -I${ROOT_DIR}/third_party/boost -I${ROOT_DIR}/App/include -I${ROOT_DIR}/ClientShared -I${ROOT_DIR}/Log/include -I${ROOT_DIR}/Rendering/G3D/include -I${ROOT_DIR}/Network/include"
-          
-          ./gradlew assembleDebug \
-            -Pandroid.ndkVersion=26.1.10909125 \
-            -DCMAKE_CXX_FLAGS="${EXTRA_INCLUDES} -std=c++14 -fpermissive -Wno-everything" \
-            -DCMAKE_C_FLAGS="${EXTRA_INCLUDES} -Wno-everything" \
-            --stacktrace
-
-      - name: Upload Generated APK
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-debug-apk
-          path: '**/build/outputs/apk/**/*.apk'
-          if-no-files-found: error
+            cat << 'EOF' > ClientShared/StringConv.
