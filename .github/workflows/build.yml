@@ -19,17 +19,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party/boost
-          key: win-boost-1.58.0-v1
+          key: win-boost-1.58.0-v2
 
       - name: Download & Extract Boost Headers (1.58.0)
         shell: pwsh
         run: |
-          if (-not (Test-Path "third_party/boost/boost")) {
+          if (-not (Test-Path "third_party/boost/boost/functional/hash.hpp")) {
+            Remove-Item -Recurse -Force "third_party/boost" -ErrorAction SilentlyContinue
             New-Item -ItemType Directory -Force -Path "third_party/boost" | Out-Null
             curl.exe -sL "https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2" -o "boost.tar.bz2"
             tar.exe -xjf "boost.tar.bz2" -C "third_party/boost" --strip-components=1 "boost_1_58_0/boost"
             Remove-Item -Force "boost.tar.bz2"
           }
+          if (-not (Test-Path "third_party/boost/boost/functional/hash.hpp")) {
+            Write-Error "Boost nao foi extraido corretamente (hash.hpp ausente)."
+            exit 1
+          }
+          Write-Host "Boost OK: $((Get-Item 'third_party/boost/boost/functional/hash.hpp').FullName)"
 
       - name: Setup Visual Studio Developer Environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -39,10 +45,17 @@ jobs:
       - name: Build Windows Project
         shell: pwsh
         run: |
-          $root = (Get-Location).Path
-          $boostInc = "$root\third_party\boost"
+          $ErrorActionPreference = "Continue"
+          $repo = (Get-Location).Path
+          $boostInc = "$repo\third_party\boost"
 
-          # Localiza headers ATL/MFC dentro do MSVC para corrigir 'atlbase.h'
+          # Detecta a raiz real do projeto (pode haver pasta aninhada)
+          $root = $repo
+          $nested = Get-ChildItem -Path $repo -Directory | Where-Object { Test-Path (Join-Path $_.FullName "App") } | Select-Object -First 1
+          if (-not (Test-Path (Join-Path $repo "App")) -and $nested) { $root = $nested.FullName }
+          Write-Host "Raiz do projeto: $root"
+
+          # Headers ATL/MFC dentro do MSVC (corrige 'atlbase.h')
           $atlInc = @()
           if ($env:VCToolsInstallDir) {
             Get-ChildItem -Path $env:VCToolsInstallDir -Filter "atlbase.h" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
@@ -52,14 +65,20 @@ jobs:
           }
 
           $extraInc = @($boostInc, $root, "$root\App\include", "$root\ClientShared", "$root\Log\include", "$root\Rendering\G3D\include", "$root\Network\include") + $atlInc
-          $env:INCLUDE = (($extraInc -join ";") + ";" + $env:INCLUDE)
+          $extraInc = $extraInc | Where-Object { Test-Path $_ }
 
-          # Detecta PlatformToolset e WindowsTargetPlatformVersion
+          # INCLUDE sozinho e ignorado pelo MSBuild; a variavel CL e lida diretamente pelo cl.exe
+          $env:INCLUDE = (($extraInc -join ";") + ";" + $env:INCLUDE)
+          $env:CL = (($extraInc | ForEach-Object { "/I`"$_`"" }) -join " ") + " /permissive- /FS /MP1"
+          Write-Host "CL=$env:CL"
+
+          # PlatformToolset e Windows SDK
           $toolset = "v143"
           if ($env:VCToolsVersion) {
             $major = [int]($env:VCToolsVersion.Split('.')[0])
-            if ($major -ge 144) { $toolset = "v145" }
-            elseif ($major -eq 143) { $toolset = "v143" }
+            $minor = [int]($env:VCToolsVersion.Split('.')[1])
+            if ($major -ge 15 -or $minor -ge 50) { $toolset = "v145" }
+            else { $toolset = "v143" }
           }
 
           $winSdkRoot = "C:\Program Files (x86)\Windows Kits\10\Include"
@@ -67,16 +86,16 @@ jobs:
           if (Test-Path $winSdkRoot) {
             $latestSdk = Get-ChildItem -Path $winSdkRoot -Directory |
               Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-              Sort-Object Name -Descending |
+              Sort-Object { [version]$_.Name } -Descending |
               Select-Object -First 1
             if ($latestSdk) { $sdkVer = $latestSdk.Name }
           }
 
-          $allSlns = Get-ChildItem -Path . -Filter "*.sln" -Recurse -Depth 5
+          $allSlns = Get-ChildItem -Path $root -Filter "*.sln" -Recurse -Depth 5
           $sln = $allSlns | Where-Object { $_.Name -notmatch "CSharp" -and $_.Name -match "Client" } | Select-Object -First 1
-          if (-not $sln) {
-            $sln = $allSlns | Select-Object -First 1
-          }
+          if (-not $sln) { $sln = $allSlns | Select-Object -First 1 }
+
+          $failed = $false
 
           if ($sln) {
             Write-Host "Compilando Solution: $($sln.FullName)"
@@ -99,7 +118,6 @@ jobs:
 
             Write-Host "Usando Configuration='$cfg', Platform='$plat', Toolset='$toolset', SDK='$sdkVer'"
 
-            # Compila projetos principais individualmente se existirem (evita falhas em PrepForUpload / UnitTest)
             $targetProjects = @(
               "WindowsClient\WindowsClient.vcxproj",
               "RobloxStudio\RobloxStudio.vcxproj",
@@ -107,47 +125,48 @@ jobs:
               "Network\Network.vcxproj"
             ) | Where-Object { Test-Path (Join-Path $root $_) }
 
+            $msbArgs = @(
+              "/p:Configuration=$cfg",
+              "/p:Platform=$plat",
+              "/p:PlatformToolset=$toolset",
+              "/p:WindowsTargetPlatformVersion=$sdkVer",
+              "/p:PostBuildEventUseInBuild=false",
+              "/p:PreBuildEventUseInBuild=false",
+              "/p:WarningLevel=0",
+              "/p:TreatWarningsAsErrors=false",
+              "/maxCpuCount:1",
+              "/nologo",
+              "/v:minimal"
+            )
+
             if ($targetProjects.Count -gt 0) {
               foreach ($proj in $targetProjects) {
                 $fullProj = Join-Path $root $proj
                 Write-Host "Compilando projeto: $fullProj"
-                msbuild.exe "$fullProj" `
-                  "/p:Configuration=$cfg" `
-                  "/p:Platform=$plat" `
-                  "/p:PlatformToolset=$toolset" `
-                  "/p:WindowsTargetPlatformVersion=$sdkVer" `
-                  "/p:PostBuildEventUseInBuild=false" `
-                  "/p:PreBuildEventUseInBuild=false" `
-                  /maxCpuCount:1 `
-                  /p:WarningLevel=0 `
-                  /p:TreatWarningsAsErrors=false
+                & msbuild.exe $fullProj @msbArgs
+                if ($LASTEXITCODE -ne 0) { Write-Host "FALHOU: $proj"; $failed = $true }
               }
             } else {
-              msbuild.exe "$($sln.FullName)" `
-                "/p:Configuration=$cfg" `
-                "/p:Platform=$plat" `
-                "/p:PlatformToolset=$toolset" `
-                "/p:WindowsTargetPlatformVersion=$sdkVer" `
-                "/p:PostBuildEventUseInBuild=false" `
-                "/p:PreBuildEventUseInBuild=false" `
-                /maxCpuCount:1 `
-                /p:WarningLevel=0 `
-                /p:TreatWarningsAsErrors=false
+              & msbuild.exe $sln.FullName @msbArgs
+              if ($LASTEXITCODE -ne 0) { $failed = $true }
             }
           } else {
-            $cmake = Get-ChildItem -Path . -Filter "CMakeLists.txt" -Recurse -Depth 5 | Select-Object -First 1
+            $cmake = Get-ChildItem -Path $root -Filter "CMakeLists.txt" -Recurse -Depth 5 | Select-Object -First 1
             if (-not $cmake) {
-              Write-Error "Nenhum arquivo .sln ou CMakeLists.txt encontrado no repositório."
+              Write-Error "Nenhum arquivo .sln ou CMakeLists.txt encontrado no repositorio."
               exit 1
             }
             $srcDir = Split-Path $cmake.FullName
-            $buildDir = "$root\build_win"
+            $buildDir = "$repo\build_win"
             New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
             cmake.exe -S "$srcDir" -B "$buildDir" -A x64 `
               -DCMAKE_CXX_FLAGS="/I`"$boostInc`" /permissive /w" `
               -DCMAKE_C_FLAGS="/I`"$boostInc`" /w"
             cmake.exe --build "$buildDir" --config Release --parallel 1
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
           }
+
+          if ($failed) { exit 1 }
 
       - name: Upload Built Windows Binaries
         if: success()
