@@ -1,693 +1,336 @@
-name: "Auto Build Windows & Web Gambiarra + Release"
+name: Portar e Compilar XboxUWPClient para Android (.so)
 
 on:
   push:
-    branches: [ "**" ]
-  pull_request:
-    branches: [ "**" ]
+    branches: [ main, master ]
   workflow_dispatch:
-    inputs:
-      build_configuration:
-        description: "Configuração"
-        required: true
-        type: choice
-        options: [ Release, Debug ]
-        default: Release
-      platform:
-        description: "Plataforma Windows da solution"
-        required: true
-        type: choice
-        options: [ x64, x86, ARM ]
-        default: x64
-      release_tag:
-        description: "Tag da GitHub Release"
-        required: true
-        default: "latest-build"
-      contribs_direct_url:
-        description: "Opcional: URL direta do Contribs.zip se o MediaFire bloquear"
-        required: false
-        default: ""
-
-# Por padrão só leitura; só o job de release recebe permissão de escrita.
-permissions:
-  contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
-  BUILD_CONFIG: ${{ github.event.inputs.build_configuration || 'Release' }}
-  WIN_PLATFORM: ${{ github.event.inputs.platform || 'x64' }}
-  RELEASE_TAG: ${{ github.event.inputs.release_tag || 'latest-build' }}
-  MEDIAFIRE_PAGE_URL: "https://www.mediafire.com/file/2srfgcurru99dfu/Contribs.zip/file?action=check"
-  # Ordem: input manual > variável do repositório (Settings > Variables) > vazio (usa MediaFire)
-  CONTRIBS_DIRECT_URL: ${{ github.event.inputs.contribs_direct_url || vars.CONTRIBS_DIRECT_URL || '' }}
+  ANDROID_NDK_VERSION: "26.3.11579264"
+  ANDROID_ABI: "arm64-v8a"
+  ANDROID_PLATFORM: "android-24"
 
 jobs:
-  build-windows-uwp:
-    name: Windows - XboxUWPClient
-    runs-on: windows-latest
-    timeout-minutes: 90
-
-    steps:
-      - name: Checkout repositório
-        uses: actions/checkout@v4
-
-      - name: Configurar ambiente MSVC (VsDevCmd.bat)
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) {
-            Write-Error "vswhere.exe não encontrado."
-            exit 1
-          }
-          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath | Select-Object -First 1
-          if (-not $installPath) {
-            Write-Error "Instalação do Visual Studio com MSBuild não encontrada."
-            exit 1
-          }
-          $devCmd = Join-Path $installPath "Common7\Tools\VsDevCmd.bat"
-          if (-not (Test-Path $devCmd)) {
-            Write-Error "VsDevCmd.bat não encontrado em $devCmd"
-            exit 1
-          }
-          Write-Host "Visual Studio em: $installPath"
-
-          "VS_INSTALL_PATH=$installPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          $arch = switch ($env:WIN_PLATFORM) {
-            "x64"   { "amd64" }
-            "ARM"   { "arm" }
-            default { "x86" }
-          }
-
-          # Usa um .cmd temporário para evitar problemas de aspas ao chamar o cmd.exe
-          $bat = Join-Path $env:RUNNER_TEMP "vsenv.cmd"
-          Set-Content -Path $bat -Encoding ascii -Value @(
-            '@echo off',
-            "call `"$devCmd`" -no_logo -arch=$arch -host_arch=amd64 -startdir=none >nul 2>&1",
-            'set'
-          )
-          $envLines = cmd /c $bat
-
-          $currentPath = $env:PATH -split ';'
-          foreach ($line in $envLines) {
-            if ($line -notmatch '^([^=]+)=(.*)$') { continue }
-            $name = $Matches[1]
-            $val  = $Matches[2]
-            if ($name -ieq "PATH") {
-              # GITHUB_PATH espera um diretório por linha
-              foreach ($p in ($val -split ';')) {
-                if ($p -and ($currentPath -notcontains $p)) {
-                  $p | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-                }
-              }
-            }
-            elseif ($name -notmatch '^(GITHUB_|RUNNER_|ACTIONS_)' -and
-                    [Environment]::GetEnvironmentVariable($name) -ne $val) {
-              "$name=$val" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            }
-          }
-
-      - name: Restaurar cache do Contribs
-        id: contribs-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: third_party
-          key: contribs-v1
-
-      - name: Baixar e extrair Contribs.zip (com retry)
-        if: steps.contribs-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path "third_party" -Force | Out-Null
-          $zipFile = Join-Path $env:RUNNER_TEMP "Contribs.zip"
-          $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-
-          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
-          if (-not $sevenZip) { $sevenZip = "C:\Program Files\7-Zip\7z.exe" }
-
-          $downloadUrl = $env:CONTRIBS_DIRECT_URL
-          if ([string]::IsNullOrWhiteSpace($downloadUrl)) {
-            Write-Host "Consultando página do MediaFire..."
-            $htmlFile = Join-Path $env:RUNNER_TEMP "mediafire_page.html"
-            curl.exe -L --fail --silent --show-error --retry 5 --retry-delay 3 -A $ua $env:MEDIAFIRE_PAGE_URL -o $htmlFile
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "Falha ao abrir a página do MediaFire (exit code $LASTEXITCODE). Informe contribs_direct_url no workflow_dispatch ou crie a variável de repositório CONTRIBS_DIRECT_URL."
-              exit 1
-            }
-            $html = Get-Content -Path $htmlFile -Raw -ErrorAction SilentlyContinue
-            if (-not $html) { $html = "" }
-            Remove-Item $htmlFile -Force -ErrorAction SilentlyContinue
-
-            $downloadUrl = $null
-
-            # O MediaFire às vezes entrega o link codificado em base64 no botão de download
-            $m = [regex]::Match($html, 'data-scrambled-url="([^"]+)"')
-            if ($m.Success) {
-              try {
-                $downloadUrl = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($m.Groups[1].Value))
-              } catch {
-                $downloadUrl = $null
-              }
-            }
-
-            if (-not $downloadUrl) {
-              $m = [regex]::Match($html, 'https?://download[0-9]+\.mediafire\.com/[^"''\s<>]+Contribs\.zip[^"''\s<>]*')
-              if (-not $m.Success) {
-                $m = [regex]::Match($html, 'https?://[^"''\s<>]*mediafire\.com/[^"''\s<>]*Contribs\.zip[^"''\s<>]*')
-              }
-              if ($m.Success) {
-                $downloadUrl = [System.Net.WebUtility]::HtmlDecode($m.Value)
-              }
-            }
-
-            if (-not $downloadUrl) {
-              Write-Error "Não foi possível extrair o link direto do MediaFire. Informe contribs_direct_url no workflow_dispatch ou crie a variável de repositório CONTRIBS_DIRECT_URL."
-              exit 1
-            }
-            Write-Host "Link direto do MediaFire encontrado."
-          }
-
-          Write-Host "Baixando Contribs.zip no runner..."
-          $maxAttempts = 5
-          $ok = $false
-          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-            Write-Host "Tentativa $attempt de $maxAttempts..."
-            Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
-
-            curl.exe -L --fail --silent --show-error --retry 3 --retry-delay 5 --retry-connrefused `
-              -A $ua -H "Referer: https://www.mediafire.com/" $downloadUrl -o $zipFile
-
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $zipFile)) {
-              Write-Warning "Falha no curl (exit code $LASTEXITCODE). Aguardando retentativa..."
-              Start-Sleep -Seconds 5
-              continue
-            }
-
-            $bytes = Get-Content -Path $zipFile -AsByteStream -TotalCount 2
-            $header = [System.Text.Encoding]::ASCII.GetString($bytes)
-            if ($header -ne "PK") {
-              Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
-              Write-Error "O arquivo baixado não é um ZIP (provavelmente uma página HTML de bloqueio). Use contribs_direct_url com um link direto."
-              exit 1
-            }
-
-            $sizeMB = [math]::Round(((Get-Item $zipFile).Length / 1MB), 1)
-            Write-Host "Download concluído ($sizeMB MB). Testando integridade..."
-            & $sevenZip t $zipFile -y | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "ZIP íntegro!"
-              $ok = $true
-              break
-            }
-            Write-Warning "ZIP corrompido (exit code $LASTEXITCODE). Baixando de novo..."
-          }
-
-          if (-not $ok) {
-            Write-Error "Não foi possível baixar um Contribs.zip íntegro após $maxAttempts tentativas."
-            exit 1
-          }
-
-          Write-Host "Extraindo..."
-          & $sevenZip x $zipFile "-othird_party" -mmt=on -y -bso0 -bsp0
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Falha durante a extração com 7z (exit code $LASTEXITCODE)."
-            exit 1
-          }
-
-          Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
-          Write-Host "Contribs extraído."
-
-      - name: Salvar cache do Contribs
-        if: steps.contribs-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: third_party
-          key: contribs-v1
-
-      - name: Preparar caminhos do Contribs (Boost, zlib e links na raiz do drive)
-        shell: pwsh
-        run: |
-          $repoRoot = (Get-Location).Path
-          $driveRoot = [System.IO.Path]::GetPathRoot($repoRoot)
-          $thirdPartyFull = Join-Path $repoRoot "third_party"
-
-          $includeDirs = @()
-          $libDirs = @()
-
-          $boostDir = Get-ChildItem -Path $thirdPartyFull -Filter "boost_1_56_0" -Recurse -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($boostDir) {
-            Write-Host "Boost encontrado em: $($boostDir.FullName)"
-            $includeDirs += $boostDir.FullName
-            $boostLib = Join-Path $boostDir.FullName "stage\lib"
-            if (Test-Path $boostLib) { $libDirs += $boostLib }
-
-            $rootBoostLink = Join-Path $driveRoot "boost_1_56_0"
-            if (-not (Test-Path $rootBoostLink)) {
-              New-Item -ItemType Junction -Path $rootBoostLink -Value $boostDir.FullName -ErrorAction SilentlyContinue | Out-Null
-            }
-          }
-
-          # Procura zlib.h
-          $zlibHeaders = Get-ChildItem -Path $thirdPartyFull -Filter "zlib.h" -Recurse -File -ErrorAction SilentlyContinue
-          foreach ($zh in $zlibHeaders) {
-            $dir = $zh.DirectoryName
-            if ($includeDirs -notcontains $dir) {
-              Write-Host "Header zlib.h encontrado em: $dir"
-              $includeDirs += $dir
-            }
-          }
-
-          # Subpastas comuns de include/lib em third_party + junction na raiz do drive
-          Get-ChildItem -Path $thirdPartyFull -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-            $sub = $_.FullName
-            if ($includeDirs -notcontains $sub) { $includeDirs += $sub }
-            $incSub = Join-Path $sub "include"
-            if ((Test-Path $incSub) -and ($includeDirs -notcontains $incSub)) { $includeDirs += $incSub }
-            $libSub = Join-Path $sub "lib"
-            if ((Test-Path $libSub) -and ($libDirs -notcontains $libSub)) { $libDirs += $libSub }
-
-            $rootLink = Join-Path $driveRoot $_.Name
-            if (-not (Test-Path $rootLink)) {
-              New-Item -ItemType Junction -Path $rootLink -Value $sub -ErrorAction SilentlyContinue | Out-Null
-            }
-          }
-
-          $incJoined = ($includeDirs -join ";")
-          $libJoined = ($libDirs -join ";")
-          Write-Host "IncludeDirs extras: $incJoined"
-          Write-Host "LibDirs extras: $libJoined"
-
-          # Passar /p:IncludePath=... na linha de comando SUBSTITUI os caminhos padrão do MSVC
-          # (e o $(IncludePath) vira texto literal). Por isso as pastas extras entram por um
-          # arquivo .targets importado no fim de cada projeto, que apenas ACRESCENTA diretórios.
-          $propsPath = Join-Path $env:RUNNER_TEMP "ci_extra.targets"
-          $incXml = [System.Security.SecurityElement]::Escape($incJoined)
-          $libXml = [System.Security.SecurityElement]::Escape($libJoined)
-          @"
-          <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-            <ItemDefinitionGroup>
-              <ClCompile>
-                <AdditionalIncludeDirectories>$incXml;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-              </ClCompile>
-              <ResourceCompile>
-                <AdditionalIncludeDirectories>$incXml;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-              </ResourceCompile>
-              <Link>
-                <AdditionalLibraryDirectories>$libXml;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-              </Link>
-              <Lib>
-                <AdditionalLibraryDirectories>$libXml;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-              </Lib>
-            </ItemDefinitionGroup>
-          </Project>
-          "@ | Set-Content -Path $propsPath -Encoding utf8
-
-          "EXTRA_PROPS_FILE=$propsPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Detectar Toolset e SDK instalados e ajustar .vcxproj
-        shell: pwsh
-        run: |
-          # ---- Toolset: procura os realmente instalados (não assume versão do VS) ----
-          $vcRoot = Join-Path $env:VS_INSTALL_PATH "MSBuild\Microsoft\VC"
-          $installedToolsets = @()
-          if (Test-Path $vcRoot) {
-            $installedToolsets = @(
-              Get-ChildItem -Path $vcRoot -Filter "Toolset.props" -Recurse -File -ErrorAction SilentlyContinue |
-                ForEach-Object { Split-Path -Leaf (Split-Path -Parent $_.FullName) } |
-                Where-Object { $_ -match '^v\d+$' } |
-                Sort-Object -Unique
-            )
-          }
-          Write-Host "Toolsets instalados: $($installedToolsets -join ', ')"
-
-          if ($installedToolsets.Count -gt 0) {
-            $targetToolset = $installedToolsets | Sort-Object { [int]($_ -replace '^v', '') } -Descending | Select-Object -First 1
-          } else {
-            $targetToolset = "v143"
-          }
-
-          # ---- Windows SDK: prefere 26100, senão usa o mais novo instalado ----
-          $kitsInclude = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include"
-          $sdks = @(
-            Get-ChildItem -Path $kitsInclude -Directory -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -match '^10\.0\.\d+\.\d+$' } |
-              Sort-Object { [version]$_.Name } -Descending |
-              ForEach-Object { $_.Name }
-          )
-          Write-Host "Windows SDKs instalados: $($sdks -join ', ')"
-          if ($sdks -contains "10.0.26100.0") {
-            $targetSdk = "10.0.26100.0"
-          } elseif ($sdks.Count -gt 0) {
-            $targetSdk = $sdks[0]
-          } else {
-            $targetSdk = "10.0.26100.0"
-          }
-
-          Write-Host "Usando PlatformToolset: $targetToolset | Windows SDK: $targetSdk"
-          "RESOLVED_TOOLSET=$targetToolset" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RESOLVED_SDK=$targetSdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          # ---- Ajusta os .vcxproj do repositório ----
-          Get-ChildItem -Path . -Filter "*.vcxproj" -Recurse |
-            Where-Object { $_.FullName -notmatch '\\third_party\\' } |
-            ForEach-Object {
-              $path = $_.FullName
-              $original = Get-Content -Path $path -Raw
-              $content = $original
-
-              # 1) Remove a extensão WindowsMobile (não existe nos SDKs novos).
-              #    Precisa vir ANTES de trocar a versão do SDK.
-              $content = [regex]::Replace($content, '(?s)<SDKReference\s+Include="WindowsMobile[^"]*"\s*/>', '')
-              $content = [regex]::Replace($content, '(?s)<SDKReference\s+Include="WindowsMobile[^"]*"\s*>.*?</SDKReference>', '')
-              $content = [regex]::Replace($content, '(?s)<SDKExtensionReference[^>]*WindowsMobile[^>]*/>', '')
-
-              # 2) Versões antigas do SDK -> SDK instalado
-              $content = $content -replace '10\.0\.14393\.0', $targetSdk
-              $content = $content -replace '10\.0\.10240\.0', $targetSdk
-
-              # 3) Toolsets antigos -> toolset instalado
-              $content = [regex]::Replace($content, '(<PlatformToolset[^>]*>)v1\d\d(</PlatformToolset>)', "`${1}$targetToolset`${2}")
-
-              if ($content -ne $original) {
-                Write-Host "Ajustado: $($_.Name)"
-                Set-Content -Path $path -Value $content -NoNewline -Encoding utf8
-              }
-            }
-
-      - name: Aplicar patches no código (UWP)
-        shell: pwsh
-        run: |
-          # RakNet: bitstream.h usa ntohs/htons sem incluir winsock2.h no build UWP (erro C3861)
-          $files = Get-ChildItem -Path . -Recurse -Filter "bitstream.h" -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\raknet\\' -and $_.FullName -notmatch '\\third_party\\' }
-
-          foreach ($f in $files) {
-            $c = Get-Content -Path $f.FullName -Raw
-            if ($c -match 'CI_PATCH_WINSOCK') {
-              Write-Host "Já com patch: $($f.FullName)"
-              continue
-            }
-            $patch = "// CI_PATCH_WINSOCK`r`n#if defined(_WIN32)`r`n#include <winsock2.h>`r`n#endif`r`n"
-            Set-Content -Path $f.FullName -Value ($patch + $c) -NoNewline -Encoding utf8
-            Write-Host "Patch aplicado: $($f.FullName)"
-          }
-          if (-not $files) { Write-Warning "bitstream.h do RakNet não encontrado." }
-
-      - name: Compilar XboxUWPClient.sln
-        shell: pwsh
-        run: |
-          $sln = Get-ChildItem -Path . -Filter "XboxUWPClient.sln" -Recurse -File | Select-Object -First 1
-          if (-not $sln) {
-            Write-Error "XboxUWPClient.sln não encontrado."
-            exit 1
-          }
-          # Usa o MSBuild do próprio Visual Studio detectado (o "msbuild" do PATH pode ser
-          # uma versão antiga que não conhece o switch -restore).
-          $msbuild = $null
-          $candidates = @(
-            (Join-Path $env:VS_INSTALL_PATH "MSBuild\Current\Bin\amd64\MSBuild.exe"),
-            (Join-Path $env:VS_INSTALL_PATH "MSBuild\Current\Bin\MSBuild.exe")
-          )
-          foreach ($c in $candidates) {
-            if (Test-Path $c) { $msbuild = $c; break }
-          }
-          if (-not $msbuild) {
-            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-            $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
-          }
-          if (-not $msbuild) {
-            Write-Error "MSBuild.exe não encontrado."
-            exit 1
-          }
-          Write-Host "Usando MSBuild: $msbuild"
-          & $msbuild -nologo -version
-
-          $toolset = if ($env:RESOLVED_TOOLSET) { $env:RESOLVED_TOOLSET } else { "v143" }
-          $sdk     = if ($env:RESOLVED_SDK)     { $env:RESOLVED_SDK }     else { "10.0.26100.0" }
-
-          Write-Host "Compilando $($sln.FullName) [$($env:BUILD_CONFIG)|$($env:WIN_PLATFORM)] com SDK $sdk e Toolset $toolset"
-
-          $logDir = Join-Path $env:GITHUB_WORKSPACE "build_logs"
-          New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-
-          $msbuildArgs = @(
-            $sln.FullName,
-            "-restore",
-            "/p:RestorePackagesConfig=true",
-            "/p:Configuration=$($env:BUILD_CONFIG)",
-            "/p:Platform=$($env:WIN_PLATFORM)",
-            "/p:PlatformToolset=$toolset",
-            "/p:WindowsTargetPlatformVersion=$sdk",
-            "/p:WindowsTargetPlatformMinVersion=$sdk",
-            "/p:AppxBundle=Never",
-            "/p:AppxPackageSigningEnabled=false",
-            "/m",
-            "/nologo",
-            "/nodeReuse:false",
-            # Console: só erros (os milhares de avisos C4267 escondiam o erro real)
-            "/clp:ErrorsOnly;Summary",
-            # Arquivos de log completos, enviados como artefato no fim do job
-            "/flp1:logfile=$logDir\msbuild_errors.log;errorsonly;encoding=utf-8",
-            "/flp2:logfile=$logDir\msbuild_full.log;verbosity=minimal;encoding=utf-8"
-          )
-          if ($env:EXTRA_PROPS_FILE -and (Test-Path $env:EXTRA_PROPS_FILE)) {
-            $msbuildArgs += "/p:CustomAfterMicrosoftCommonTargets=$($env:EXTRA_PROPS_FILE)"
-          }
-
-          & $msbuild @msbuildArgs
-          if ($LASTEXITCODE -ne 0) {
-            $code = $LASTEXITCODE
-            Write-Host "=== ÚLTIMOS ERROS DO MSBUILD ==="
-            $errLog = Join-Path $logDir "msbuild_errors.log"
-            if (Test-Path $errLog) { Get-Content $errLog -Tail 100 }
-            Write-Error "MSBuild falhou (exit code $code)."
-            exit $code
-          }
-
-      - name: Upload logs do MSBuild
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: msbuild-logs
-          path: build_logs/
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Empacotar artefato Windows (.zip)
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path "release_assets" -Force | Out-Null
-          $root = (Get-Location).Path
-          $winOut = Join-Path $root "release_assets\windows-uwp-$($env:WIN_PLATFORM)-$($env:BUILD_CONFIG).zip"
-
-          $exts = @(".exe", ".dll", ".lib", ".appx", ".appxbundle", ".msix", ".msixbundle")
-          $files = @(
-            Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue |
-              Where-Object {
-                ($exts -contains $_.Extension.ToLower()) -and
-                ($_.FullName -notmatch '\\(third_party|release_assets|\.git|node_modules)\\')
-              }
-          )
-
-          if ($files.Count -gt 0) {
-            # Copia mantendo a estrutura de pastas (evita erro de nomes duplicados no zip)
-            $stage = Join-Path $env:RUNNER_TEMP "win_stage"
-            Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
-            New-Item -ItemType Directory -Path $stage -Force | Out-Null
-            foreach ($f in $files) {
-              $rel = $f.FullName.Substring($root.Length).TrimStart('\')
-              $dest = Join-Path $stage $rel
-              New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
-              Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
-            }
-            Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $winOut -Force
-            Write-Host "Gerado: $winOut ($($files.Count) arquivos)"
-          } else {
-            "Nenhum binário gerado pelo MSBuild." | Out-File (Join-Path $root "release_assets\windows-build-info.txt")
-          }
-
-      - name: Upload artefato Windows
-        uses: actions/upload-artifact@v4
-        with:
-          name: win-release-assets
-          path: release_assets/
-          if-no-files-found: error
-
-  build-web-gambiarra:
-    name: Web - Gambiarra (WASM Bridge + HTML5)
+  patch-and-build-android:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
 
     steps:
-      - name: Checkout repositório
+      - name: Checkout do repositório
         uses: actions/checkout@v4
 
-      - name: Instalar Emscripten SDK
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: "3.1.74"
-          actions-cache-folder: "emsdk-cache"
-
-      - name: Gerar módulo WASM + runner HTML5 (gambiarra) e empacotar .zip
-        shell: bash
+      - name: Instalar ferramentas de build e dependências C++
         run: |
-          set -euo pipefail
-          mkdir -p web_out release_assets
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libboost-all-dev zlib1g-dev
 
-          cat << 'EOF' > web_out/gambiarra_bridge.cpp
-          #include <emscripten/emscripten.h>
+      - name: Configurar Android SDK e NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "ndk;${{ env.ANDROID_NDK_VERSION }}"
 
-          extern "C" {
-            EMSCRIPTEN_KEEPALIVE
-            const char* get_client_info() {
-              return "XboxUWPClient Web Gambiarra Bridge (WASM)";
-            }
+      - name: Criar camada de compatibilidade (Shims Win32/UWP -> Android) e modificar arquivos
+        run: |
+          mkdir -p android_port/shims
 
-            EMSCRIPTEN_KEEPALIVE
-            int ping_bridge(int v) {
-              return v + 1;
-            }
+          # 1. Criar shim de <windows.h> para código legado da engine que checa tipos Win32
+          cat << 'EOF' > android_port/shims/windows.h
+          #pragma once
+          #include <stdint.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <pthread.h>
+          #include <time.h>
+
+          typedef uint32_t DWORD;
+          typedef uint16_t WORD;
+          typedef uint8_t BYTE;
+          typedef int32_t LONG;
+          typedef uint32_t ULONG;
+          typedef uint64_t ULONGLONG;
+          typedef int64_t LONGLONG;
+          typedef int BOOL;
+          typedef void* HANDLE;
+          typedef void* HWND;
+          typedef void* HMODULE;
+          typedef long HRESULT;
+
+          #ifndef TRUE
+          #define TRUE 1
+          #define FALSE 0
+          #endif
+          #define S_OK ((HRESULT)0L)
+          #define E_FAIL ((HRESULT)0x80004005L)
+          #define WINAPI
+          #define CALLBACK
+
+          inline ULONGLONG GetTickCount64() {
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (ULONGLONG)(ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL);
+          }
+          inline DWORD GetCurrentThreadId() { return (DWORD)(uintptr_t)pthread_self(); }
+          inline void OutputDebugStringA(const char* s) { (void)s; }
+          EOF
+
+          # 2. Criar shims vazios para headers exclusivos de Windows/DirectX
+          touch android_port/shims/wrl.h
+          touch android_port/shims/ppltasks.h
+          touch android_port/shims/d3d11_3.h
+          touch android_port/shims/dxgi1_4.h
+          cat << 'EOF' > android_port/shims/io.h
+          #pragma once
+          #include <unistd.h>
+          #define _access access
+          EOF
+
+          # 3. Modificar XboxUWPClient/stdafx.h e pch.h para usar Android em vez de WinRT/DirectX
+          cp XboxUWPClient/stdafx.h XboxUWPClient/stdafx.h.bak
+          cat << 'EOF' > XboxUWPClient/stdafx.h
+          #pragma once
+          #include <stdlib.h>
+          #include <stdarg.h>
+          #include <stdio.h>
+          #include <unistd.h>
+          #include <thread>
+          #include <atomic>
+          #include <functional>
+          #include <string>
+          #include <vector>
+          #include <map>
+          #include <android/log.h>
+          EOF
+
+          cp XboxUWPClient/pch.h XboxUWPClient/pch.h.bak
+          cat << 'EOF' > XboxUWPClient/pch.h
+          #pragma once
+          #include "stdafx.h"
+          EOF
+
+          # 4. Modificar FileLog.cpp para gravar no logcat do Android e /sdcard/ ou diretório interno
+          cat << 'EOF' > XboxUWPClient/FileLog.cpp
+          #include "FileLog.h"
+          #include <android/log.h>
+          #include <stdio.h>
+          #include <stdarg.h>
+
+          namespace FileLog {
+              bool init(const wchar_t*, const wchar_t*) { return true; }
+              bool enabled() { return true; }
+              const wchar_t* dirWide() { return L"/data/local/tmp"; }
+              const char* dirNarrow() { return "/data/local/tmp"; }
+              void write(const char* data) {
+                  __android_log_print(ANDROID_LOG_INFO, "RobloxAndroidPort", "%s", data ? data : "");
+              }
+              void writef(const char* fmt, ...) {
+                  char buf[4096];
+                  va_list va;
+                  va_start(va, fmt);
+                  vsnprintf(buf, sizeof(buf), fmt, va);
+                  va_end(va);
+                  write(buf);
+              }
           }
           EOF
 
-          emcc web_out/gambiarra_bridge.cpp \
-            -O2 \
-            -s WASM=1 \
-            -s EXPORTED_FUNCTIONS='["_get_client_info","_ping_bridge"]' \
-            -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap"]' \
-            -o web_out/gambiarra_bridge.js
+          # 5. Criar novo entrypoint Android nativo (substitui o main.cpp com C++/CX e IFrameworkView)
+          cat << 'EOF' > android_port/android_main.cpp
+          #include "stdafx.h"
+          #include <jni.h>
+          #include <android/native_window.h>
+          #include <android/native_window_jni.h>
+          #include <android/log.h>
 
-          cat << 'EOF' > web_out/index.html
-          <!doctype html>
-          <html lang="pt-BR">
-          <head>
-            <meta charset="utf-8" />
-            <title>XboxUWPClient - Web Gambiarra</title>
-            <style>
-              body { font-family: sans-serif; background: #111; color: #eee; margin: 0; padding: 20px; }
-              canvas { display: block; width: 100%; max-width: 960px; height: 540px; background: #1d1f27; border: 1px solid #333; margin-top: 12px; }
-              .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-              input, button { padding: 8px 12px; border-radius: 6px; border: 1px solid #444; background: #222; color: #fff; }
-              button { cursor: pointer; background: #2b6cb0; border-color: #2b6cb0; }
-            </style>
-          </head>
-          <body>
-            <h2>XboxUWPClient — Web Gambiarra Runner</h2>
-            <p>Abra por um servidor HTTP (ex.: <code>python -m http.server</code>); o WASM não carrega via file://.</p>
-            <div class="bar">
-              <input id="wsUrl" type="text" value="ws://localhost:8080" size="28" />
-              <button id="btnConnect">Conectar Stream/Bridge</button>
-              <button id="btnPing">Testar WASM</button>
-              <span id="status">Aguardando...</span>
-            </div>
-            <canvas id="screen" width="1280" height="720"></canvas>
+          #include "v8datamodel/PlatformService.h"
+          #include "v8datamodel/TeleportCallback.h"
+          #include "FastLog.h"
 
-            <script>
-              // Define o Module ANTES de carregar o JS do Emscripten
-              var Module = {
-                onRuntimeInitialized: function () {
-                  var info = Module.ccall("get_client_info", "string", [], []);
-                  document.getElementById("status").textContent = info;
-                }
-              };
-            </script>
-            <script src="gambiarra_bridge.js"></script>
-            <script>
-              const statusEl = document.getElementById("status");
-              const canvas = document.getElementById("screen");
-              const ctx = canvas.getContext("2d");
-              let ws = null;
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "RobloxUWP2Android", __VA_ARGS__)
 
-              function drawPlaceholder(msg) {
-                ctx.fillStyle = "#1d1f27";
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                ctx.fillStyle = "#9ca3af";
-                ctx.font = "20px sans-serif";
-                ctx.fillText(msg, 32, 64);
+          extern "C" void dprintf(const char* fmt, ...) {
+              char buffer[4096];
+              va_list va;
+              va_start(va, fmt);
+              vsnprintf(buffer, sizeof(buffer), fmt, va);
+              va_end(va);
+              LOGI("%s", buffer);
+          }
+
+          // Stub da camada de plataforma que substitui XboxPlatform (sem Xbox Live / WinRT)
+          class AndroidPlatform : public RBX::IPlatformAPI, public RBX::TeleportCallback {
+          public:
+              AndroidPlatform() { LOGI("AndroidPlatform inicializada a partir do port XboxUWPClient!"); }
+              virtual ~AndroidPlatform() {}
+
+              void requestGameShutdown(bool teleport) override { (void)teleport; }
+              void voiceChatSetMuteState(int userId, bool mute) override { (void)userId; (void)mute; }
+              unsigned voiceChatGetState(int userId) override { (void)userId; return 0; }
+
+              RBX::AccountAuthResult performAuthorization(RBX::InputObject::UserInputType, bool) override {
+                  return RBX::AccountAuth_Success;
               }
+              int netConnectionCheck() override { return 1; }
+              void setScreenResolution(double px, double py) override {
+                  LOGI("Resolucao Android definida: %.0fx%.0f", px, py);
+              }
+              shared_ptr<const RBX::Reflection::ValueTable> getPlatformUserInfo() override {
+                  return shared_ptr<const RBX::Reflection::ValueTable>();
+              }
+              int performAccountLink(const std::string&, const std::string&, std::string*) override { return 0; }
+              int performUnlinkAccount(std::string*) override { return 0; }
+              int performSetRobloxCredentials(const std::string&, const std::string&, std::string*) override { return 0; }
+              RBX::AccountAuthResult performHasRobloxCredentials() override { return RBX::AccountAuth_Success; }
+              RBX::AccountAuthResult performHasLinkedAccount() override { return RBX::AccountAuth_Success; }
+          };
 
-              drawPlaceholder("WASM carregado. Conecte a um host/bridge ou use como frontend web.");
+          static AndroidPlatform* g_platform = nullptr;
 
-              document.getElementById("btnPing").onclick = () => {
-                const res = Module.ccall("ping_bridge", "number", ["number"], [41]);
-                statusEl.textContent = "WASM ping -> " + res;
-              };
-
-              document.getElementById("btnConnect").onclick = () => {
-                const url = document.getElementById("wsUrl").value.trim();
-                if (ws) ws.close();
-                ws = new WebSocket(url);
-                ws.binaryType = "arraybuffer";
-                ws.onopen = () => statusEl.textContent = "Conectado em " + url;
-                ws.onclose = () => statusEl.textContent = "Desconectado";
-                ws.onerror = () => statusEl.textContent = "Erro de conexão WS";
-                ws.onmessage = async (ev) => {
-                  if (ev.data instanceof ArrayBuffer) {
-                    const blob = new Blob([ev.data], { type: "image/jpeg" });
-                    const bmp = await createImageBitmap(blob);
-                    ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_roblox_uwpport_MainActivity_nativeInit(JNIEnv* env, jobject thiz, jobject surface) {
+              (void)thiz;
+              ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+              if (window) {
+                  int w = ANativeWindow_getWidth(window);
+                  int h = ANativeWindow_getHeight(window);
+                  LOGI("Surface Android anexada: %dx%d", w, h);
+                  if (!g_platform) {
+                      g_platform = new AndroidPlatform();
                   }
-                };
-              };
-            </script>
-          </body>
-          </html>
+                  g_platform->setScreenResolution(w, h);
+                  ANativeWindow_release(window);
+              }
+          }
           EOF
 
-          rm -f web_out/gambiarra_bridge.cpp
-          ls -lh web_out
-          zip -r "release_assets/web-gambiarra-${BUILD_CONFIG}.zip" web_out/
+      - name: Gerar CMakeLists.txt linkando engine + camada Android
+        run: |
+          python3 - << 'EOF'
+          import os, re
 
-      - name: Upload artefato Web
+          projects = [
+              "Base",
+              "Log",
+              "zlib",
+              "App.BulletPhysics",
+              "CSG",
+              "Network",
+              "GfxBase",
+              "RbxG3D",
+              "graphics3D",
+              "AppDraw",
+              "App"
+          ]
+
+          include_dirs = [
+              "android_port/shims",
+              "XboxUWPClient",
+              "Base/include",
+              "Log/include",
+              "App/include",
+              "App/lua-5.1.4/src",
+              "App.BulletPhysics",
+              "CSG/sgCore",
+              "CSG/include",
+              "Network",
+              "Network/include",
+              "Network/include/network",
+              "Network/raknet/Source",
+              "Rendering",
+              "Rendering/AppDraw",
+              "Rendering/AppDraw/include",
+              "Rendering/GfxBase",
+              "Rendering/GfxBase/include",
+              "Rendering/GfxCore/include",
+              "Rendering/GfxRender",
+              "Rendering/GfxRender/include",
+              "Rendering/GfxRender/freetype/include",
+              "Rendering/RbxG3D/include",
+              "Rendering/g3d",
+              "Rendering/g3d/include",
+              "ClientBase",
+              "ClientShared"
+          ]
+
+          cmake = [
+              "cmake_minimum_required(VERSION 3.22)",
+              "project(RobloxUWPPortAndroid CXX C)",
+              "set(CMAKE_CXX_STANDARD 14)",
+              "set(CMAKE_POSITION_INDEPENDENT_CODE ON)",
+              "add_compile_definitions(BOOST_ALL_NO_LIB __ANDROID__ RBX_PLATFORM_ANDROID GLES2)",
+              "add_compile_options(-fpermissive -Wno-everything)",
+          ]
+
+          valid_incs = [d for d in include_dirs if os.path.isdir(d)]
+          cmake.append("include_directories(" + " ".join(f'"{d}"' for d in valid_incs) + ")")
+
+          built_targets = []
+          for proj in projects:
+              vcxproj = f"XboxUWPClient/Projects/{proj}.vcxproj"
+              if not os.path.exists(vcxproj):
+                  continue
+              with open(vcxproj, "r", errors="ignore") as f:
+                  content = f.read()
+
+              raw_srcs = re.findall(r'<ClCompile Include="([^"]+)"', content)
+              srcs = []
+              for s in raw_srcs:
+                  if "$" in s:
+                      continue
+                  norm = os.path.normpath(os.path.join("XboxUWPClient/Projects", s.replace("\\", "/")))
+                  # Troca renderizadores D3D11/Win32 por equivalentes OpenGL ES / POSIX quando existirem
+                  if any(k in norm.lower() for k in ["d3d11", "win32", "durango", "uwp"]):
+                      continue
+                  if os.path.exists(norm):
+                      srcs.append(norm)
+
+              if srcs:
+                  tname = proj.replace(".", "_")
+                  built_targets.append(tname)
+                  s_list = "\n  ".join(f'"{x}"' for x in sorted(set(srcs)))
+                  cmake.append(f"\nadd_library({tname} STATIC\n  {s_list}\n)")
+
+          # Biblioteca compartilhada final (.so) do cliente Android portado
+          client_srcs = [
+              "android_port/android_main.cpp",
+              "XboxUWPClient/FileLog.cpp",
+              "XboxUWPClient/renderJob.cpp",
+              "XboxUWPClient/async.cpp"
+          ]
+          client_srcs = [s for s in client_srcs if os.path.exists(s)]
+          cmake.append("\nadd_library(roblox_android SHARED\n  " + "\n  ".join(f'"{s}"' for s in client_srcs) + "\n)")
+          cmake.append("target_link_libraries(roblox_android android log EGL GLESv2 " + " ".join(built_targets) + ")")
+
+          with open("CMakeLists.txt", "w") as out:
+              out.write("\n".join(cmake))
+          EOF
+
+      - name: Configurar e compilar com Android NDK
+        run: |
+          NDK_PATH="${ANDROID_HOME}/ndk/${{ env.ANDROID_NDK_VERSION }}"
+          cmake -B build-android \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${{ env.ANDROID_ABI }}" \
+            -DANDROID_PLATFORM="${{ env.ANDROID_PLATFORM }}" \
+            -DANDROID_STL=c++_shared
+
+          cmake --build build-android -- -k 0 2>&1 | tee build_android.log || true
+
+      - name: Verificar bibliotecas geradas e listar erros restantes
+        run: |
+          echo "=== Arquivos .a e .so compilados ==="
+          find build-android -name "*.a" -o -name "*.so"
+          echo "=== Erros únicos encontrados (para próximos patches) ==="
+          grep -i "error:" build_android.log | sed 's/.*error:/error:/' | sort | uniq -c | sort -nr | head -n 40 || true
+
+      - name: Upload dos artefatos e arquivos modificados
         uses: actions/upload-artifact@v4
         with:
-          name: web-release-assets
-          path: release_assets/
-          if-no-files-found: error
-
-  release:
-    name: Publicar GitHub Release
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: [ build-windows-uwp, build-web-gambiarra ]
-    # Só publica em push na branch padrão ou execução manual (nunca em PR).
-    # O build web basta; se o Windows falhar, a release sai só com o zip web.
-    if: ${{ !cancelled() && needs.build-web-gambiarra.result == 'success' && github.event_name != 'pull_request' && (github.event_name == 'workflow_dispatch' || github.ref_name == github.event.repository.default_branch) }}
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout repositório
-        uses: actions/checkout@v4
-
-      - name: Baixar artefatos
-        uses: actions/download-artifact@v4
-        with:
-          pattern: "*-release-assets"
-          path: release_assets
-          merge-multiple: true
-
-      - name: Listar arquivos da release
-        shell: bash
-        run: ls -lh release_assets
-
-      - name: Mover a tag para este commit
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f "$RELEASE_TAG" "$GITHUB_SHA"
-          git push -f origin "refs/tags/$RELEASE_TAG"
-
-      - name: Publicar tudo no GitHub Releases
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: "Build ${{ env.RELEASE_TAG }} (${{ env.BUILD_CONFIG }})"
-          draft: false
-          prerelease: false
-          fail_on_unmatched_files: true
-          files: release_assets/*
+          name: roblox-android-port-build
+          path: |
+            build-android/**/*.a
+            build-android/**/*.so
+            build_android.log
+            CMakeLists.txt
+            android_port/
+          if-no-files-found: ignore
