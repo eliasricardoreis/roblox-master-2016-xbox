@@ -42,23 +42,51 @@ jobs:
           $root = (Get-Location).Path
           $boostInc = "$root\third_party\boost"
           $extraInc = "$boostInc;$root;$root\App\include;$root\ClientShared;$root\Log\include;$root\Rendering\G3D\include;$root\Network\include"
-
-          # Garante INCLUDE com Boost e pastas principais do projeto
           $env:INCLUDE = "$extraInc;$env:INCLUDE"
 
-          $sln = Get-ChildItem -Path . -Filter "*.sln" -Recurse -Depth 4 | Select-Object -First 1
+          $allSlns = Get-ChildItem -Path . -Filter "*.sln" -Recurse -Depth 5
+          # Prioriza solution C++ principal se existir, senão pega a primeira disponível
+          $sln = $allSlns | Where-Object { $_.Name -notmatch "CSharp" -and $_.Name -match "Client" } | Select-Object -First 1
+          if (-not $sln) {
+            $sln = $allSlns | Select-Object -First 1
+          }
 
           if ($sln) {
             Write-Host "Compilando Solution: $($sln.FullName)"
-            msbuild.exe "$($sln.FullName)" `
-              /p:Configuration=Release `
-              /p:Platform=x64 `
-              /maxCpuCount:1 `
-              /p:ForceImportBeforeCppTargets="" `
-              /p:WarningLevel=0 `
-              /p:TreatWarningsAsErrors=false
+            $slnContent = Get-Content -Path $sln.FullName -Raw
+            $configs = [regex]::Matches($slnContent, '^\s*(Debug|Release)\|([^=\r\n]+)\s*=', 'Multiline') |
+              ForEach-Object { "$($_.Groups[1].Value)|$($_.Groups[2].Value.Trim())" } |
+              Select-Object -Unique
+
+            Write-Host "Configuracoes encontradas na solution: $($configs -join ', ')"
+
+            $chosen = $configs | Where-Object { $_ -match "^Release\|(x64|Any CPU|Win32|x86)$" } | Select-Object -First 1
+            if (-not $chosen) {
+              $chosen = $configs | Select-Object -First 1
+            }
+
+            if ($chosen) {
+              $parts = $chosen.Split('|', 2)
+              $cfg = $parts[0]
+              $plat = $parts[1]
+              Write-Host "Usando Configuration='$cfg' e Platform='$plat'"
+              msbuild.exe "$($sln.FullName)" `
+                "/p:Configuration=$cfg" `
+                "/p:Platform=$plat" `
+                /maxCpuCount:1 `
+                /p:ForceImportBeforeCppTargets="" `
+                /p:WarningLevel=0 `
+                /p:TreatWarningsAsErrors=false
+            } else {
+              Write-Host "Usando configuracao padrao da solution"
+              msbuild.exe "$($sln.FullName)" `
+                /maxCpuCount:1 `
+                /p:ForceImportBeforeCppTargets="" `
+                /p:WarningLevel=0 `
+                /p:TreatWarningsAsErrors=false
+            }
           } else {
-            $cmake = Get-ChildItem -Path . -Filter "CMakeLists.txt" -Recurse -Depth 4 | Select-Object -First 1
+            $cmake = Get-ChildItem -Path . -Filter "CMakeLists.txt" -Recurse -Depth 5 | Select-Object -First 1
             if (-not $cmake) {
               Write-Error "Nenhum arquivo .sln ou CMakeLists.txt encontrado no repositório."
               exit 1
