@@ -44,8 +44,27 @@ jobs:
           $extraInc = "$boostInc;$root;$root\App\include;$root\ClientShared;$root\Log\include;$root\Rendering\G3D\include;$root\Network\include"
           $env:INCLUDE = "$extraInc;$env:INCLUDE"
 
+          # Detecta o PlatformToolset instalado no MSVC (ex.: v143 ou v145)
+          $vcRoot = Join-Path $env:VCToolsInstallDir "Auxiliary\Build"
+          $toolset = "v143"
+          if ($env:VCToolsVersion) {
+            $major = [int]($env:VCToolsVersion.Split('.')[0])
+            if ($major -ge 144) { $toolset = "v145" }
+            elseif ($major -eq 143) { $toolset = "v143" }
+          }
+
+          # Detecta a versão mais recente do Windows 10/11 SDK instalada
+          $winSdkRoot = "C:\Program Files (x86)\Windows Kits\10\Include"
+          $sdkVer = "10.0.22621.0"
+          if (Test-Path $winSdkRoot) {
+            $latestSdk = Get-ChildItem -Path $winSdkRoot -Directory |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+            if ($latestSdk) { $sdkVer = $latestSdk.Name }
+          }
+
           $allSlns = Get-ChildItem -Path . -Filter "*.sln" -Recurse -Depth 5
-          # Prioriza solution C++ principal se existir, senão pega a primeira disponível
           $sln = $allSlns | Where-Object { $_.Name -notmatch "CSharp" -and $_.Name -match "Client" } | Select-Object -First 1
           if (-not $sln) {
             $sln = $allSlns | Select-Object -First 1
@@ -60,7 +79,11 @@ jobs:
 
             Write-Host "Configuracoes encontradas na solution: $($configs -join ', ')"
 
-            $chosen = $configs | Where-Object { $_ -match "^Release\|(x64|Any CPU|Win32|x86)$" } | Select-Object -First 1
+            # Prioriza Release|Win32 ou Release|x64 para compilar projetos C++ nativos
+            $chosen = $configs | Where-Object { $_ -match "^Release\|(Win32|x64|x86)$" } | Select-Object -First 1
+            if (-not $chosen) {
+              $chosen = $configs | Where-Object { $_ -match "^Release\|" } | Select-Object -First 1
+            }
             if (-not $chosen) {
               $chosen = $configs | Select-Object -First 1
             }
@@ -69,17 +92,20 @@ jobs:
               $parts = $chosen.Split('|', 2)
               $cfg = $parts[0]
               $plat = $parts[1]
-              Write-Host "Usando Configuration='$cfg' e Platform='$plat'"
+              Write-Host "Usando Configuration='$cfg', Platform='$plat', Toolset='$toolset', WindowsTargetPlatformVersion='$sdkVer'"
               msbuild.exe "$($sln.FullName)" `
                 "/p:Configuration=$cfg" `
                 "/p:Platform=$plat" `
+                "/p:PlatformToolset=$toolset" `
+                "/p:WindowsTargetPlatformVersion=$sdkVer" `
                 /maxCpuCount:1 `
                 /p:ForceImportBeforeCppTargets="" `
                 /p:WarningLevel=0 `
                 /p:TreatWarningsAsErrors=false
             } else {
-              Write-Host "Usando configuracao padrao da solution"
               msbuild.exe "$($sln.FullName)" `
+                "/p:PlatformToolset=$toolset" `
+                "/p:WindowsTargetPlatformVersion=$sdkVer" `
                 /maxCpuCount:1 `
                 /p:ForceImportBeforeCppTargets="" `
                 /p:WarningLevel=0 `
@@ -94,7 +120,6 @@ jobs:
             $srcDir = Split-Path $cmake.FullName
             $buildDir = "$root\build_win"
             New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
-            Write-Host "Compilando via CMake em: $srcDir"
             cmake.exe -S "$srcDir" -B "$buildDir" -A x64 `
               -DCMAKE_CXX_FLAGS="/I`"$boostInc`" /permissive /w" `
               -DCMAKE_C_FLAGS="/I`"$boostInc`" /w"
