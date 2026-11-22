@@ -1,7 +1,9 @@
-name: Build Android APK
+name: Build Android APK (2016 Source)
 
 on:
   push:
+    branches: [ main, master ]
+  pull_request:
     branches: [ main, master ]
   workflow_dispatch:
 
@@ -19,52 +21,124 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+
       - name: Setup Android SDK & NDK 26
         uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125 cmake;3.22.1'
 
-      - name: Prepare Boost, Symlinks & NDK Shims
+      - name: Cache Boost Headers
+        id: cache-boost
+        uses: actions/cache@v4
+        with:
+          path: third_party/boost
+          key: boost-1.58.0-headers
+
+      - name: Download & Extract Boost Headers (1.58.0)
+        if: steps.cache-boost.outputs.cache-hit != 'true'
         run: |
-          # 1. Boost Headers (se ainda não estiverem no repo)
-          if [ ! -d "third_party/boost/boost" ]; then
-            mkdir -p third_party/boost
-            curl -sL https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2 -o boost.tar.bz2
-            tar -xjf boost.tar.bz2 -C third_party/boost --strip-components=1 boost_1_58_0/boost
-            rm boost.tar.bz2
+          mkdir -p third_party/boost
+          curl -sL https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2 -o boost.tar.bz2
+          tar -xjf boost.tar.bz2 -C third_party/boost --strip-components=1 boost_1_58_0/boost
+          rm boost.tar.bz2
+
+      - name: Fix Linux Case-Sensitivity & Create Shims
+        run: |
+          # 1. Symlinks para pastas em minúsculo
+          for pair in \
+            "App/include/v8tree:App/include/V8Tree" \
+            "App/include/util:App/include/Util" \
+            "App/include/reflection:App/include/Reflection" \
+            "App/include/rbx:App/include/Rbx" \
+            "App/include/v8datamodel:App/include/V8DataModel" \
+            "App/include/v8world:App/include/V8World" \
+            "App/include/v8xml:App/include/V8Xml" \
+            "App/include/security:App/include/Security" \
+            "App/include/script:App/include/Script" \
+            "App/include/humanoid:App/include/Humanoid" \
+            "App/include/network:App/include/Network" \
+            "Rendering/g3d:Rendering/G3D" \
+            "Rendering/G3D/include/g3d:Rendering/G3D/include/G3D"
+          do
+            SRC="${pair%%:*}"
+            DST="${pair##*:}"
+            [ -d "$SRC" ] && [ ! -e "$DST" ] && ln -s "$(basename "$SRC")" "$DST" || true
+          done
+
+          # 2. Shim sys/atomics.h para NDK 26
+          mkdir -p android_port/shims/sys
+          printf '%s\n' \
+            '#pragma once' \
+            '#ifdef __cplusplus' \
+            'extern "C" {' \
+            '#endif' \
+            'static inline int __atomic_cmpxchg(int o, int n, volatile int* p) { return __sync_val_compare_and_swap(p, o, n); }' \
+            'static inline int __atomic_inc(volatile int* p) { return __sync_fetch_and_add(p, 1); }' \
+            'static inline int __atomic_dec(volatile int* p) { return __sync_fetch_and_sub(p, 1); }' \
+            'static inline int __atomic_swap(int n, volatile int* p) { return __sync_lock_test_and_set(p, n); }' \
+            '#ifdef __cplusplus' \
+            '}' \
+            '#endif' > android_port/shims/sys/atomics.h
+
+          # 3. Patch StringConv.cpp para Android
+          if [ -f "ClientShared/StringConv.cpp" ]; then
+            printf '%s\n' \
+              '#include "StringConv.h"' \
+              '#include <codecvt>' \
+              '#include <locale>' \
+              '#include <string>' \
+              'namespace RBX {' \
+              '    std::string utf8_encode(const std::wstring& wstr) {' \
+              '        if (wstr.empty()) return std::string();' \
+              '        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;' \
+              '        return conv.to_bytes(wstr);' \
+              '    }' \
+              '    std::wstring utf8_decode(const std::string& str) {' \
+              '        if (str.empty()) return std::wstring();' \
+              '        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;' \
+              '        return conv.from_bytes(str);' \
+              '    }' \
+              '}' > ClientShared/StringConv.cpp
           fi
 
-          # 2. Symlinks para case-sensitivity do Linux
-          [ -d "App/include/v8tree" ] && [ ! -e "App/include/V8Tree" ] && ln -s v8tree App/include/V8Tree || true
-          [ -d "App/include/util" ] && [ ! -e "App/include/Util" ] && ln -s util App/include/Util || true
-          [ -d "App/include/reflection" ] && [ ! -e "App/include/Reflection" ] && ln -s reflection App/include/Reflection || true
-          [ -d "App/include/rbx" ] && [ ! -e "App/include/Rbx" ] && ln -s rbx App/include/Rbx || true
-          [ -d "App/include/v8datamodel" ] && [ ! -e "App/include/V8DataModel" ] && ln -s v8datamodel App/include/V8DataModel || true
-          [ -d "App/include/v8world" ] && [ ! -e "App/include/V8World" ] && ln -s v8world App/include/V8World || true
-          [ -d "App/include/v8xml" ] && [ ! -e "App/include/V8Xml" ] && ln -s v8xml App/include/V8Xml || true
-          [ -d "App/include/security" ] && [ ! -e "App/include/Security" ] && ln -s security App/include/Security || true
-          [ -d "App/include/script" ] && [ ! -e "App/include/Script" ] && ln -s script App/include/Script || true
-          [ -d "App/include/humanoid" ] && [ ! -e "App/include/Humanoid" ] && ln -s humanoid App/include/Humanoid || true
-          [ -d "App/include/network" ] && [ ! -e "App/include/Network" ] && ln -s network App/include/Network || true
-          [ -d "Rendering/g3d" ] && [ ! -e "Rendering/G3D" ] && ln -s g3d Rendering/G3D || true
-          [ -d "Rendering/G3D/include/g3d" ] && [ ! -e "Rendering/G3D/include/G3D" ] && ln -s g3d Rendering/G3D/include/G3D || true
+      - name: Build Debug APK
+        env:
+          ROOT_DIR: ${{ github.workspace }}
+        run: |
+          EXTRA_INCLUDES="-I${ROOT_DIR} -I${ROOT_DIR}/android_port/shims -I${ROOT_DIR}/third_party/boost -I${ROOT_DIR}/App/include -I${ROOT_DIR}/ClientShared -I${ROOT_DIR}/Log/include -I${ROOT_DIR}/Rendering/G3D/include -I${ROOT_DIR}/Network/include"
 
-          # 3. Shim sys/atomics.h para NDK 26
-          mkdir -p android_port/shims/sys
-          cat << 'EOF' > android_port/shims/sys/atomics.h
-          #pragma once
-          #ifdef __cplusplus
-          extern "C" {
-          #endif
-          static inline int __atomic_cmpxchg(int o, int n, volatile int* p) { return __sync_val_compare_and_swap(p, o, n); }
-          static inline int __atomic_inc(volatile int* p) { return __sync_fetch_and_add(p, 1); }
-          static inline int __atomic_dec(volatile int* p) { return __sync_fetch_and_sub(p, 1); }
-          static inline int __atomic_swap(int n, volatile int* p) { return __sync_lock_test_and_set(p, n); }
-          #ifdef __cplusplus
-          }
-          #endif
-          EOF
+          GRADLEW_PATH=$(find . -maxdepth 3 -name "gradlew" | head -n 1)
+          if [ -n "$GRADLEW_PATH" ]; then
+            cd "$(dirname "$GRADLEW_PATH")"
+            chmod +x gradlew
+            GRADLE_BIN="./gradlew"
+          else
+            BUILD_GRADLE=$(find . -maxdepth 3 \( -name "settings.gradle*" -o -name "build.gradle*" \) | head -n 1)
+            if [ -z "$BUILD_GRADLE" ]; then
+              echo "ERRO: Nenhum projeto Gradle encontrado no repositório!"
+              ls -la
+              exit 1
+            fi
+            cd "$(dirname "$BUILD_GRADLE")"
+            GRADLE_BIN="gradle"
+          fi
 
-          # 4. Patch StringConv.cpp para Android
-          if [ -f "ClientShared/StringConv.cpp" ]; then
-            cat << 'EOF' > ClientShared/StringConv.
+          $GRADLE_BIN assembleDebug \
+            --parallel \
+            --build-cache \
+            -Pandroid.ndkVersion=26.1.10909125 \
+            -DCMAKE_CXX_FLAGS="${EXTRA_INCLUDES} -std=c++14 -fpermissive -Wno-everything" \
+            -DCMAKE_C_FLAGS="${EXTRA_INCLUDES} -Wno-everything" \
+            --stacktrace
+
+      - name: Upload Generated APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: '**/build/outputs/apk/**/*.apk'
+          if-no-files-found: error
