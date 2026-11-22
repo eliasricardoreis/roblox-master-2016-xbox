@@ -1,336 +1,132 @@
-name: Portar e Compilar XboxUWPClient para Android (.so)
+name: Build Android APK (2016 Source)
 
 on:
   push:
     branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
-env:
-  ANDROID_NDK_VERSION: "26.3.11579264"
-  ANDROID_ABI: "arm64-v8a"
-  ANDROID_PLATFORM: "android-24"
-
 jobs:
-  patch-and-build-android:
+  build-apk:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout do repositório
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Instalar ferramentas de build e dependências C++
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libboost-all-dev zlib1g-dev
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
 
-      - name: Configurar Android SDK e NDK
+      - name: Setup Android SDK & NDK 26
         uses: android-actions/setup-android@v3
         with:
-          packages: "ndk;${{ env.ANDROID_NDK_VERSION }}"
+          packages: 'platforms;android-34 build-tools;34.0.0 ndk;26.1.10909125 cmake;3.22.1'
 
-      - name: Criar camada de compatibilidade (Shims Win32/UWP -> Android) e modificar arquivos
+      - name: Download & Extract Boost Headers (1.58.0)
         run: |
-          mkdir -p android_port/shims
+          mkdir -p third_party/boost
+          curl -L https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2 -o boost.tar.bz2
+          tar -xjf boost.tar.bz2 -C third_party/boost --strip-components=1 boost_1_58_0/boost
+          rm boost.tar.bz2
 
-          # 1. Criar shim de <windows.h> para código legado da engine que checa tipos Win32
-          cat << 'EOF' > android_port/shims/windows.h
+      - name: Fix Linux Case-Sensitivity Symlinks
+        run: |
+          # Cria links simbólicos para pastas em minúsculo que o código C++ inclui com maiúsculas
+          [ -d "App/include/v8tree" ] && [ ! -e "App/include/V8Tree" ] && ln -s v8tree App/include/V8Tree || true
+          [ -d "App/include/util" ] && [ ! -e "App/include/Util" ] && ln -s util App/include/Util || true
+          [ -d "App/include/reflection" ] && [ ! -e "App/include/Reflection" ] && ln -s reflection App/include/Reflection || true
+          [ -d "App/include/rbx" ] && [ ! -e "App/include/Rbx" ] && ln -s rbx App/include/Rbx || true
+          [ -d "App/include/v8datamodel" ] && [ ! -e "App/include/V8DataModel" ] && ln -s v8datamodel App/include/V8DataModel || true
+          [ -d "App/include/v8world" ] && [ ! -e "App/include/V8World" ] && ln -s v8world App/include/V8World || true
+          [ -d "App/include/v8xml" ] && [ ! -e "App/include/V8Xml" ] && ln -s v8xml App/include/V8Xml || true
+          [ -d "App/include/security" ] && [ ! -e "App/include/Security" ] && ln -s security App/include/Security || true
+          [ -d "App/include/script" ] && [ ! -e "App/include/Script" ] && ln -s script App/include/Script || true
+          [ -d "App/include/humanoid" ] && [ ! -e "App/include/Humanoid" ] && ln -s humanoid App/include/Humanoid || true
+          [ -d "App/include/network" ] && [ ! -e "App/include/Network" ] && ln -s network App/include/Network || true
+          [ -d "Rendering/g3d" ] && [ ! -e "Rendering/G3D" ] && ln -s g3d Rendering/G3D || true
+          [ -d "Rendering/G3D/include/g3d" ] && [ ! -e "Rendering/G3D/include/G3D" ] && ln -s g3d Rendering/G3D/include/G3D || true
+
+      - name: Create NDK 26 Compatibility Shims (sys/atomics.h)
+        run: |
+          mkdir -p android_port/shims/sys
+          cat << 'EOF' > android_port/shims/sys/atomics.h
           #pragma once
           #include <stdint.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
-          #include <pthread.h>
-          #include <time.h>
 
-          typedef uint32_t DWORD;
-          typedef uint16_t WORD;
-          typedef uint8_t BYTE;
-          typedef int32_t LONG;
-          typedef uint32_t ULONG;
-          typedef uint64_t ULONGLONG;
-          typedef int64_t LONGLONG;
-          typedef int BOOL;
-          typedef void* HANDLE;
-          typedef void* HWND;
-          typedef void* HMODULE;
-          typedef long HRESULT;
-
-          #ifndef TRUE
-          #define TRUE 1
-          #define FALSE 0
+          #ifdef __cplusplus
+          extern "C" {
           #endif
-          #define S_OK ((HRESULT)0L)
-          #define E_FAIL ((HRESULT)0x80004005L)
-          #define WINAPI
-          #define CALLBACK
 
-          inline ULONGLONG GetTickCount64() {
-              struct timespec ts;
-              clock_gettime(CLOCK_MONOTONIC, &ts);
-              return (ULONGLONG)(ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL);
+          static inline int __atomic_cmpxchg(int old_val, int new_val, volatile int* ptr) {
+              return __sync_val_compare_and_swap(ptr, old_val, new_val);
           }
-          inline DWORD GetCurrentThreadId() { return (DWORD)(uintptr_t)pthread_self(); }
-          inline void OutputDebugStringA(const char* s) { (void)s; }
+
+          static inline int __atomic_inc(volatile int* ptr) {
+              return __sync_fetch_and_add(ptr, 1);
+          }
+
+          static inline int __atomic_dec(volatile int* ptr) {
+              return __sync_fetch_and_sub(ptr, 1);
+          }
+
+          static inline int __atomic_swap(int new_val, volatile int* ptr) {
+              return __sync_lock_test_and_set(ptr, new_val);
+          }
+
+          #ifdef __cplusplus
+          }
+          #endif
           EOF
 
-          # 2. Criar shims vazios para headers exclusivos de Windows/DirectX
-          touch android_port/shims/wrl.h
-          touch android_port/shims/ppltasks.h
-          touch android_port/shims/d3d11_3.h
-          touch android_port/shims/dxgi1_4.h
-          cat << 'EOF' > android_port/shims/io.h
-          #pragma once
-          #include <unistd.h>
-          #define _access access
-          EOF
-
-          # 3. Modificar XboxUWPClient/stdafx.h e pch.h para usar Android em vez de WinRT/DirectX
-          cp XboxUWPClient/stdafx.h XboxUWPClient/stdafx.h.bak
-          cat << 'EOF' > XboxUWPClient/stdafx.h
-          #pragma once
-          #include <stdlib.h>
-          #include <stdarg.h>
-          #include <stdio.h>
-          #include <unistd.h>
-          #include <thread>
-          #include <atomic>
-          #include <functional>
+      - name: Patch Win32 StringConv.cpp for Android
+        run: |
+          if [ -f "ClientShared/StringConv.cpp" ]; then
+            cat << 'EOF' > ClientShared/StringConv.cpp
+          #include "StringConv.h"
+          #include <codecvt>
+          #include <locale>
           #include <string>
-          #include <vector>
-          #include <map>
-          #include <android/log.h>
-          EOF
 
-          cp XboxUWPClient/pch.h XboxUWPClient/pch.h.bak
-          cat << 'EOF' > XboxUWPClient/pch.h
-          #pragma once
-          #include "stdafx.h"
-          EOF
-
-          # 4. Modificar FileLog.cpp para gravar no logcat do Android e /sdcard/ ou diretório interno
-          cat << 'EOF' > XboxUWPClient/FileLog.cpp
-          #include "FileLog.h"
-          #include <android/log.h>
-          #include <stdio.h>
-          #include <stdarg.h>
-
-          namespace FileLog {
-              bool init(const wchar_t*, const wchar_t*) { return true; }
-              bool enabled() { return true; }
-              const wchar_t* dirWide() { return L"/data/local/tmp"; }
-              const char* dirNarrow() { return "/data/local/tmp"; }
-              void write(const char* data) {
-                  __android_log_print(ANDROID_LOG_INFO, "RobloxAndroidPort", "%s", data ? data : "");
+          namespace RBX {
+              std::string utf8_encode(const std::wstring& wstr) {
+                  if (wstr.empty()) return std::string();
+                  std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+                  return conv.to_bytes(wstr);
               }
-              void writef(const char* fmt, ...) {
-                  char buf[4096];
-                  va_list va;
-                  va_start(va, fmt);
-                  vsnprintf(buf, sizeof(buf), fmt, va);
-                  va_end(va);
-                  write(buf);
+
+              std::wstring utf8_decode(const std::string& str) {
+                  if (str.empty()) return std::wstring();
+                  std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+                  return conv.from_bytes(str);
               }
           }
           EOF
+          fi
 
-          # 5. Criar novo entrypoint Android nativo (substitui o main.cpp com C++/CX e IFrameworkView)
-          cat << 'EOF' > android_port/android_main.cpp
-          #include "stdafx.h"
-          #include <jni.h>
-          #include <android/native_window.h>
-          #include <android/native_window_jni.h>
-          #include <android/log.h>
+      - name: Grant Execute Permission to Gradlew
+        run: chmod +x gradlew || true
 
-          #include "v8datamodel/PlatformService.h"
-          #include "v8datamodel/TeleportCallback.h"
-          #include "FastLog.h"
-
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "RobloxUWP2Android", __VA_ARGS__)
-
-          extern "C" void dprintf(const char* fmt, ...) {
-              char buffer[4096];
-              va_list va;
-              va_start(va, fmt);
-              vsnprintf(buffer, sizeof(buffer), fmt, va);
-              va_end(va);
-              LOGI("%s", buffer);
-          }
-
-          // Stub da camada de plataforma que substitui XboxPlatform (sem Xbox Live / WinRT)
-          class AndroidPlatform : public RBX::IPlatformAPI, public RBX::TeleportCallback {
-          public:
-              AndroidPlatform() { LOGI("AndroidPlatform inicializada a partir do port XboxUWPClient!"); }
-              virtual ~AndroidPlatform() {}
-
-              void requestGameShutdown(bool teleport) override { (void)teleport; }
-              void voiceChatSetMuteState(int userId, bool mute) override { (void)userId; (void)mute; }
-              unsigned voiceChatGetState(int userId) override { (void)userId; return 0; }
-
-              RBX::AccountAuthResult performAuthorization(RBX::InputObject::UserInputType, bool) override {
-                  return RBX::AccountAuth_Success;
-              }
-              int netConnectionCheck() override { return 1; }
-              void setScreenResolution(double px, double py) override {
-                  LOGI("Resolucao Android definida: %.0fx%.0f", px, py);
-              }
-              shared_ptr<const RBX::Reflection::ValueTable> getPlatformUserInfo() override {
-                  return shared_ptr<const RBX::Reflection::ValueTable>();
-              }
-              int performAccountLink(const std::string&, const std::string&, std::string*) override { return 0; }
-              int performUnlinkAccount(std::string*) override { return 0; }
-              int performSetRobloxCredentials(const std::string&, const std::string&, std::string*) override { return 0; }
-              RBX::AccountAuthResult performHasRobloxCredentials() override { return RBX::AccountAuth_Success; }
-              RBX::AccountAuthResult performHasLinkedAccount() override { return RBX::AccountAuth_Success; }
-          };
-
-          static AndroidPlatform* g_platform = nullptr;
-
-          extern "C" JNIEXPORT void JNICALL
-          Java_com_roblox_uwpport_MainActivity_nativeInit(JNIEnv* env, jobject thiz, jobject surface) {
-              (void)thiz;
-              ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
-              if (window) {
-                  int w = ANativeWindow_getWidth(window);
-                  int h = ANativeWindow_getHeight(window);
-                  LOGI("Surface Android anexada: %dx%d", w, h);
-                  if (!g_platform) {
-                      g_platform = new AndroidPlatform();
-                  }
-                  g_platform->setScreenResolution(w, h);
-                  ANativeWindow_release(window);
-              }
-          }
-          EOF
-
-      - name: Gerar CMakeLists.txt linkando engine + camada Android
+      - name: Build Debug APK
+        env:
+          ROOT_DIR: ${{ github.workspace }}
         run: |
-          python3 - << 'EOF'
-          import os, re
+          # Passa os caminhos de include extra diretamente para o CMake via Gradle
+          EXTRA_INCLUDES="-I${ROOT_DIR} -I${ROOT_DIR}/android_port/shims -I${ROOT_DIR}/third_party/boost -I${ROOT_DIR}/App/include -I${ROOT_DIR}/ClientShared -I${ROOT_DIR}/Log/include -I${ROOT_DIR}/Rendering/G3D/include -I${ROOT_DIR}/Network/include"
+          
+          ./gradlew assembleDebug \
+            -Pandroid.ndkVersion=26.1.10909125 \
+            -DCMAKE_CXX_FLAGS="${EXTRA_INCLUDES} -std=c++14 -fpermissive -Wno-everything" \
+            -DCMAKE_C_FLAGS="${EXTRA_INCLUDES} -Wno-everything" \
+            --stacktrace
 
-          projects = [
-              "Base",
-              "Log",
-              "zlib",
-              "App.BulletPhysics",
-              "CSG",
-              "Network",
-              "GfxBase",
-              "RbxG3D",
-              "graphics3D",
-              "AppDraw",
-              "App"
-          ]
-
-          include_dirs = [
-              "android_port/shims",
-              "XboxUWPClient",
-              "Base/include",
-              "Log/include",
-              "App/include",
-              "App/lua-5.1.4/src",
-              "App.BulletPhysics",
-              "CSG/sgCore",
-              "CSG/include",
-              "Network",
-              "Network/include",
-              "Network/include/network",
-              "Network/raknet/Source",
-              "Rendering",
-              "Rendering/AppDraw",
-              "Rendering/AppDraw/include",
-              "Rendering/GfxBase",
-              "Rendering/GfxBase/include",
-              "Rendering/GfxCore/include",
-              "Rendering/GfxRender",
-              "Rendering/GfxRender/include",
-              "Rendering/GfxRender/freetype/include",
-              "Rendering/RbxG3D/include",
-              "Rendering/g3d",
-              "Rendering/g3d/include",
-              "ClientBase",
-              "ClientShared"
-          ]
-
-          cmake = [
-              "cmake_minimum_required(VERSION 3.22)",
-              "project(RobloxUWPPortAndroid CXX C)",
-              "set(CMAKE_CXX_STANDARD 14)",
-              "set(CMAKE_POSITION_INDEPENDENT_CODE ON)",
-              "add_compile_definitions(BOOST_ALL_NO_LIB __ANDROID__ RBX_PLATFORM_ANDROID GLES2)",
-              "add_compile_options(-fpermissive -Wno-everything)",
-          ]
-
-          valid_incs = [d for d in include_dirs if os.path.isdir(d)]
-          cmake.append("include_directories(" + " ".join(f'"{d}"' for d in valid_incs) + ")")
-
-          built_targets = []
-          for proj in projects:
-              vcxproj = f"XboxUWPClient/Projects/{proj}.vcxproj"
-              if not os.path.exists(vcxproj):
-                  continue
-              with open(vcxproj, "r", errors="ignore") as f:
-                  content = f.read()
-
-              raw_srcs = re.findall(r'<ClCompile Include="([^"]+)"', content)
-              srcs = []
-              for s in raw_srcs:
-                  if "$" in s:
-                      continue
-                  norm = os.path.normpath(os.path.join("XboxUWPClient/Projects", s.replace("\\", "/")))
-                  # Troca renderizadores D3D11/Win32 por equivalentes OpenGL ES / POSIX quando existirem
-                  if any(k in norm.lower() for k in ["d3d11", "win32", "durango", "uwp"]):
-                      continue
-                  if os.path.exists(norm):
-                      srcs.append(norm)
-
-              if srcs:
-                  tname = proj.replace(".", "_")
-                  built_targets.append(tname)
-                  s_list = "\n  ".join(f'"{x}"' for x in sorted(set(srcs)))
-                  cmake.append(f"\nadd_library({tname} STATIC\n  {s_list}\n)")
-
-          # Biblioteca compartilhada final (.so) do cliente Android portado
-          client_srcs = [
-              "android_port/android_main.cpp",
-              "XboxUWPClient/FileLog.cpp",
-              "XboxUWPClient/renderJob.cpp",
-              "XboxUWPClient/async.cpp"
-          ]
-          client_srcs = [s for s in client_srcs if os.path.exists(s)]
-          cmake.append("\nadd_library(roblox_android SHARED\n  " + "\n  ".join(f'"{s}"' for s in client_srcs) + "\n)")
-          cmake.append("target_link_libraries(roblox_android android log EGL GLESv2 " + " ".join(built_targets) + ")")
-
-          with open("CMakeLists.txt", "w") as out:
-              out.write("\n".join(cmake))
-          EOF
-
-      - name: Configurar e compilar com Android NDK
-        run: |
-          NDK_PATH="${ANDROID_HOME}/ndk/${{ env.ANDROID_NDK_VERSION }}"
-          cmake -B build-android \
-            -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI="${{ env.ANDROID_ABI }}" \
-            -DANDROID_PLATFORM="${{ env.ANDROID_PLATFORM }}" \
-            -DANDROID_STL=c++_shared
-
-          cmake --build build-android -- -k 0 2>&1 | tee build_android.log || true
-
-      - name: Verificar bibliotecas geradas e listar erros restantes
-        run: |
-          echo "=== Arquivos .a e .so compilados ==="
-          find build-android -name "*.a" -o -name "*.so"
-          echo "=== Erros únicos encontrados (para próximos patches) ==="
-          grep -i "error:" build_android.log | sed 's/.*error:/error:/' | sort | uniq -c | sort -nr | head -n 40 || true
-
-      - name: Upload dos artefatos e arquivos modificados
+      - name: Upload Generated APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: roblox-android-port-build
-          path: |
-            build-android/**/*.a
-            build-android/**/*.so
-            build_android.log
-            CMakeLists.txt
-            android_port/
-          if-no-files-found: ignore
+          name: app-debug-apk
+          path: '**/build/outputs/apk/**/*.apk'
+          if-no-files-found: error
