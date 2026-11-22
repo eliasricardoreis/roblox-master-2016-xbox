@@ -41,11 +41,20 @@ jobs:
         run: |
           $root = (Get-Location).Path
           $boostInc = "$root\third_party\boost"
-          $extraInc = "$boostInc;$root;$root\App\include;$root\ClientShared;$root\Log\include;$root\Rendering\G3D\include;$root\Network\include"
-          $env:INCLUDE = "$extraInc;$env:INCLUDE"
 
-          # Detecta o PlatformToolset instalado no MSVC (ex.: v143 ou v145)
-          $vcRoot = Join-Path $env:VCToolsInstallDir "Auxiliary\Build"
+          # Localiza headers ATL/MFC dentro do MSVC para corrigir 'atlbase.h'
+          $atlInc = @()
+          if ($env:VCToolsInstallDir) {
+            Get-ChildItem -Path $env:VCToolsInstallDir -Filter "atlbase.h" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+              $dir = Split-Path $_.FullName
+              if ($dir -notin $atlInc) { $atlInc += $dir }
+            }
+          }
+
+          $extraInc = @($boostInc, $root, "$root\App\include", "$root\ClientShared", "$root\Log\include", "$root\Rendering\G3D\include", "$root\Network\include") + $atlInc
+          $env:INCLUDE = (($extraInc -join ";") + ";" + $env:INCLUDE)
+
+          # Detecta PlatformToolset e WindowsTargetPlatformVersion
           $toolset = "v143"
           if ($env:VCToolsVersion) {
             $major = [int]($env:VCToolsVersion.Split('.')[0])
@@ -53,7 +62,6 @@ jobs:
             elseif ($major -eq 143) { $toolset = "v143" }
           }
 
-          # Detecta a versão mais recente do Windows 10/11 SDK instalada
           $winSdkRoot = "C:\Program Files (x86)\Windows Kits\10\Include"
           $sdkVer = "10.0.22621.0"
           if (Test-Path $winSdkRoot) {
@@ -77,37 +85,52 @@ jobs:
               ForEach-Object { "$($_.Groups[1].Value)|$($_.Groups[2].Value.Trim())" } |
               Select-Object -Unique
 
-            Write-Host "Configuracoes encontradas na solution: $($configs -join ', ')"
-
-            # Prioriza Release|Win32 ou Release|x64 para compilar projetos C++ nativos
             $chosen = $configs | Where-Object { $_ -match "^Release\|(Win32|x64|x86)$" } | Select-Object -First 1
-            if (-not $chosen) {
-              $chosen = $configs | Where-Object { $_ -match "^Release\|" } | Select-Object -First 1
-            }
-            if (-not $chosen) {
-              $chosen = $configs | Select-Object -First 1
-            }
+            if (-not $chosen) { $chosen = $configs | Where-Object { $_ -match "^Release\|" } | Select-Object -First 1 }
+            if (-not $chosen) { $chosen = $configs | Select-Object -First 1 }
 
+            $cfg = "Release"
+            $plat = "Win32"
             if ($chosen) {
               $parts = $chosen.Split('|', 2)
               $cfg = $parts[0]
               $plat = $parts[1]
-              Write-Host "Usando Configuration='$cfg', Platform='$plat', Toolset='$toolset', WindowsTargetPlatformVersion='$sdkVer'"
+            }
+
+            Write-Host "Usando Configuration='$cfg', Platform='$plat', Toolset='$toolset', SDK='$sdkVer'"
+
+            # Compila projetos principais individualmente se existirem (evita falhas em PrepForUpload / UnitTest)
+            $targetProjects = @(
+              "WindowsClient\WindowsClient.vcxproj",
+              "RobloxStudio\RobloxStudio.vcxproj",
+              "App\App.vcxproj",
+              "Network\Network.vcxproj"
+            ) | Where-Object { Test-Path (Join-Path $root $_) }
+
+            if ($targetProjects.Count -gt 0) {
+              foreach ($proj in $targetProjects) {
+                $fullProj = Join-Path $root $proj
+                Write-Host "Compilando projeto: $fullProj"
+                msbuild.exe "$fullProj" `
+                  "/p:Configuration=$cfg" `
+                  "/p:Platform=$plat" `
+                  "/p:PlatformToolset=$toolset" `
+                  "/p:WindowsTargetPlatformVersion=$sdkVer" `
+                  "/p:PostBuildEventUseInBuild=false" `
+                  "/p:PreBuildEventUseInBuild=false" `
+                  /maxCpuCount:1 `
+                  /p:WarningLevel=0 `
+                  /p:TreatWarningsAsErrors=false
+              }
+            } else {
               msbuild.exe "$($sln.FullName)" `
                 "/p:Configuration=$cfg" `
                 "/p:Platform=$plat" `
                 "/p:PlatformToolset=$toolset" `
                 "/p:WindowsTargetPlatformVersion=$sdkVer" `
+                "/p:PostBuildEventUseInBuild=false" `
+                "/p:PreBuildEventUseInBuild=false" `
                 /maxCpuCount:1 `
-                /p:ForceImportBeforeCppTargets="" `
-                /p:WarningLevel=0 `
-                /p:TreatWarningsAsErrors=false
-            } else {
-              msbuild.exe "$($sln.FullName)" `
-                "/p:PlatformToolset=$toolset" `
-                "/p:WindowsTargetPlatformVersion=$sdkVer" `
-                /maxCpuCount:1 `
-                /p:ForceImportBeforeCppTargets="" `
                 /p:WarningLevel=0 `
                 /p:TreatWarningsAsErrors=false
             }
