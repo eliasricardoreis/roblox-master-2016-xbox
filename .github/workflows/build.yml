@@ -1,181 +1,129 @@
-name: Build Windows EXE (2016 Source)
+name: Build XboxUWPClient (Windows / UWP)
 
 on:
   push:
     branches: [ main, master ]
   pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Configuration"
+        default: "Release"
+        type: choice
+        options: [ Release, Debug ]
+      platform:
+        description: "Platform"
+        default: "x64"
+        type: choice
+        options: [ x64, Win32, ARM ]
+
+env:
+  CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
+  PLATFORM: ${{ github.event.inputs.platform || 'x64' }}
+  # Pasta onde ficam as dependências (boost_1_56_0, SDL2.0.4, cpp-netlib, curl...).
+  # O vcxproj usa $(CONTRIB_PATH). Ajuste se o seu repo usa outro caminho.
+  CONTRIB_PATH: ${{ github.workspace }}\Contribs
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    runs-on: windows-2022
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Cache Boost Headers
-        uses: actions/cache@v4
         with:
-          path: third_party/boost
-          key: win-boost-1.58.0-v2
+          submodules: recursive
+          lfs: true
 
-      - name: Download & Extract Boost Headers (1.58.0)
+      - name: Localizar XboxUWPClient.sln / .vcxproj
+        id: find
         shell: pwsh
         run: |
-          if (-not (Test-Path "third_party/boost/boost/functional/hash.hpp")) {
-            Remove-Item -Recurse -Force "third_party/boost" -ErrorAction SilentlyContinue
-            New-Item -ItemType Directory -Force -Path "third_party/boost" | Out-Null
-            curl.exe -sL "https://archives.boost.io/release/1.58.0/source/boost_1_58_0.tar.bz2" -o "boost.tar.bz2"
-            tar.exe -xjf "boost.tar.bz2" -C "third_party/boost" --strip-components=1 "boost_1_58_0/boost"
-            Remove-Item -Force "boost.tar.bz2"
-          }
-          if (-not (Test-Path "third_party/boost/boost/functional/hash.hpp")) {
-            Write-Error "Boost nao foi extraido corretamente (hash.hpp ausente)."
-            exit 1
-          }
-          Write-Host "Boost OK: $((Get-Item 'third_party/boost/boost/functional/hash.hpp').FullName)"
+          $sln = Get-ChildItem -Recurse -Filter XboxUWPClient.sln | Select-Object -First 1
+          $proj = Get-ChildItem -Recurse -Filter XboxUWPClient.vcxproj | Select-Object -First 1
+          if (-not $proj) { throw "XboxUWPClient.vcxproj não encontrado no repositório." }
+          "sln=$($sln.FullName)"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "proj=$($proj.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "dir=$($proj.DirectoryName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Projeto: $($proj.FullName)"
 
-      - name: Setup Visual Studio Developer Environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Build Windows Project
+      - name: Conferir dependências do código-fonte 2016
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Continue"
-          $repo = (Get-Location).Path
-          $boostInc = "$repo\third_party\boost"
-
-          # Detecta a raiz real do projeto (pode haver pasta aninhada)
-          $root = $repo
-          $nested = Get-ChildItem -Path $repo -Directory | Where-Object { Test-Path (Join-Path $_.FullName "App") } | Select-Object -First 1
-          if (-not (Test-Path (Join-Path $repo "App")) -and $nested) { $root = $nested.FullName }
-          Write-Host "Raiz do projeto: $root"
-
-          # Headers ATL/MFC dentro do MSVC (corrige 'atlbase.h')
-          $atlInc = @()
-          if ($env:VCToolsInstallDir) {
-            Get-ChildItem -Path $env:VCToolsInstallDir -Filter "atlbase.h" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-              $dir = Split-Path $_.FullName
-              if ($dir -notin $atlInc) { $atlInc += $dir }
-            }
+          # O vcxproj referencia pastas irmãs (..\App, ..\Base, ..\Network, ..\Rendering...)
+          $root = (Get-Item "${{ steps.find.outputs.dir }}").Parent.FullName
+          $need = 'App','Base','Network','Rendering','Log','ClientBase','ClientShared','AppBridge'
+          $missing = $need | Where-Object { -not (Test-Path (Join-Path $root $_)) }
+          if ($missing) {
+            Write-Warning "Pastas ausentes ao lado de XboxUWPClient: $($missing -join ', '). O build vai falhar sem elas."
+          }
+          if (-not (Test-Path $env:CONTRIB_PATH)) {
+            Write-Warning "CONTRIB_PATH ($env:CONTRIB_PATH) não existe. Coloque as Contribs no repo ou baixe-as em um passo antes."
           }
 
-          $extraInc = @($boostInc, $root, "$root\App\include", "$root\ClientShared", "$root\Log\include", "$root\Rendering\G3D\include", "$root\Network\include") + $atlInc
-          $extraInc = $extraInc | Where-Object { Test-Path $_ }
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
 
-          # INCLUDE sozinho e ignorado pelo MSBuild; a variavel CL e lida diretamente pelo cl.exe
-          $env:INCLUDE = (($extraInc -join ";") + ";" + $env:INCLUDE)
-          $env:CL = (($extraInc | ForEach-Object { "/I`"$_`"" }) -join " ") + " /permissive- /FS /MP1"
-          Write-Host "CL=$env:CL"
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
 
-          # PlatformToolset e Windows SDK
-          $toolset = "v143"
-          if ($env:VCToolsVersion) {
-            $major = [int]($env:VCToolsVersion.Split('.')[0])
-            $minor = [int]($env:VCToolsVersion.Split('.')[1])
-            if ($major -ge 15 -or $minor -ge 50) { $toolset = "v145" }
-            else { $toolset = "v143" }
-          }
+      - name: Detectar Windows SDK instalado
+        id: sdk
+        shell: pwsh
+        run: |
+          $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+          $ver = Get-ChildItem $inc -Directory |
+                 Where-Object { $_.Name -match '^10\.0\.\d+\.\d+$' } |
+                 Sort-Object { [version]$_.Name } -Descending |
+                 Select-Object -First 1 -ExpandProperty Name
+          Write-Host "Windows SDK: $ver"
+          "ver=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          $winSdkRoot = "C:\Program Files (x86)\Windows Kits\10\Include"
-          $sdkVer = "10.0.22621.0"
-          if (Test-Path $winSdkRoot) {
-            $latestSdk = Get-ChildItem -Path $winSdkRoot -Directory |
-              Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-              Sort-Object { [version]$_.Name } -Descending |
-              Select-Object -First 1
-            if ($latestSdk) { $sdkVer = $latestSdk.Name }
-          }
+      - name: Restaurar pacotes NuGet (Xbox Live SDK / GameChat)
+        shell: pwsh
+        run: |
+          nuget restore "${{ steps.find.outputs.dir }}\packages.config" -PackagesDirectory "${{ steps.find.outputs.dir }}\..\packages"
 
-          $allSlns = Get-ChildItem -Path $root -Filter "*.sln" -Recurse -Depth 5
-          $sln = $allSlns | Where-Object { $_.Name -notmatch "CSharp" -and $_.Name -match "Client" } | Select-Object -First 1
-          if (-not $sln) { $sln = $allSlns | Select-Object -First 1 }
+      - name: Compilar
+        shell: pwsh
+        run: |
+          # O projeto original usa v140 (VS2015) e SDK 14393; no runner usamos v143 + SDK mais novo.
+          # PreBuildEvent (BuildCoreScripts.bat) desligado, como no NOPREBUILD=1 do build.bat local.
+          msbuild "${{ steps.find.outputs.proj }}" `
+            /m /restore `
+            /p:Configuration=$env:CONFIGURATION `
+            /p:Platform=$env:PLATFORM `
+            /p:PlatformToolset=v143 `
+            /p:WindowsTargetPlatformVersion=${{ steps.sdk.outputs.ver }} `
+            /p:WindowsTargetPlatformMinVersion=10.0.14393.0 `
+            /p:PreBuildEventUseInBuild=false `
+            /p:CONTRIB_PATH="$env:CONTRIB_PATH" `
+            /p:AppxBundle=Never `
+            /p:UapAppxPackageBuildMode=SideloadOnly `
+            /p:AppxPackageSigningEnabled=true `
+            /p:PackageCertificateKeyFile="${{ steps.find.outputs.dir }}\XboxUWPClient_TemporaryKey.pfx" `
+            /p:AppxPackageDir="${{ github.workspace }}\out\AppPackages\" `
+            /verbosity:minimal
 
-          $failed = $false
+      - name: Reunir saída
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Get-ChildItem -Recurse -Include *.exe,*.dll,*.appx,*.msix,*.cer,*.pdb -Path . -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\$env:CONFIGURATION\\" -or $_.FullName -match 'AppPackages' } |
+            Where-Object { $_.FullName -notmatch '\\packages\\' } |
+            ForEach-Object { Write-Host $_.FullName }
 
-          if ($sln) {
-            Write-Host "Compilando Solution: $($sln.FullName)"
-            $slnContent = Get-Content -Path $sln.FullName -Raw
-            $configs = [regex]::Matches($slnContent, '^\s*(Debug|Release)\|([^=\r\n]+)\s*=', 'Multiline') |
-              ForEach-Object { "$($_.Groups[1].Value)|$($_.Groups[2].Value.Trim())" } |
-              Select-Object -Unique
-
-            $chosen = $configs | Where-Object { $_ -match "^Release\|(Win32|x64|x86)$" } | Select-Object -First 1
-            if (-not $chosen) { $chosen = $configs | Where-Object { $_ -match "^Release\|" } | Select-Object -First 1 }
-            if (-not $chosen) { $chosen = $configs | Select-Object -First 1 }
-
-            $cfg = "Release"
-            $plat = "Win32"
-            if ($chosen) {
-              $parts = $chosen.Split('|', 2)
-              $cfg = $parts[0]
-              $plat = $parts[1]
-            }
-
-            Write-Host "Usando Configuration='$cfg', Platform='$plat', Toolset='$toolset', SDK='$sdkVer'"
-
-            $targetProjects = @(
-              "WindowsClient\WindowsClient.vcxproj",
-              "RobloxStudio\RobloxStudio.vcxproj",
-              "App\App.vcxproj",
-              "Network\Network.vcxproj"
-            ) | Where-Object { Test-Path (Join-Path $root $_) }
-
-            $msbArgs = @(
-              "/p:Configuration=$cfg",
-              "/p:Platform=$plat",
-              "/p:PlatformToolset=$toolset",
-              "/p:WindowsTargetPlatformVersion=$sdkVer",
-              "/p:PostBuildEventUseInBuild=false",
-              "/p:PreBuildEventUseInBuild=false",
-              "/p:WarningLevel=0",
-              "/p:TreatWarningsAsErrors=false",
-              "/maxCpuCount:1",
-              "/nologo",
-              "/v:minimal"
-            )
-
-            if ($targetProjects.Count -gt 0) {
-              foreach ($proj in $targetProjects) {
-                $fullProj = Join-Path $root $proj
-                Write-Host "Compilando projeto: $fullProj"
-                & msbuild.exe $fullProj @msbArgs
-                if ($LASTEXITCODE -ne 0) { Write-Host "FALHOU: $proj"; $failed = $true }
-              }
-            } else {
-              & msbuild.exe $sln.FullName @msbArgs
-              if ($LASTEXITCODE -ne 0) { $failed = $true }
-            }
-          } else {
-            $cmake = Get-ChildItem -Path $root -Filter "CMakeLists.txt" -Recurse -Depth 5 | Select-Object -First 1
-            if (-not $cmake) {
-              Write-Error "Nenhum arquivo .sln ou CMakeLists.txt encontrado no repositorio."
-              exit 1
-            }
-            $srcDir = Split-Path $cmake.FullName
-            $buildDir = "$repo\build_win"
-            New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
-            cmake.exe -S "$srcDir" -B "$buildDir" -A x64 `
-              -DCMAKE_CXX_FLAGS="/I`"$boostInc`" /permissive /w" `
-              -DCMAKE_C_FLAGS="/I`"$boostInc`" /w"
-            cmake.exe --build "$buildDir" --config Release --parallel 1
-            if ($LASTEXITCODE -ne 0) { $failed = $true }
-          }
-
-          if ($failed) { exit 1 }
-
-      - name: Upload Built Windows Binaries
-        if: success()
+      - name: Upload artefatos
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-build-release
+          name: XboxUWPClient-${{ env.PLATFORM }}-${{ env.CONFIGURATION }}
+          if-no-files-found: warn
           path: |
-            **/*.exe
-            **/*.dll
-            !**/vcpkg/**
-            !**/third_party/**
-          if-no-files-found: error
+            out/AppPackages/**
+            **/${{ env.CONFIGURATION }}/**/*.exe
+            **/${{ env.CONFIGURATION }}/**/*.appx
+            **/${{ env.CONFIGURATION }}/**/*.msix
+            **/${{ env.CONFIGURATION }}/**/*.cer
